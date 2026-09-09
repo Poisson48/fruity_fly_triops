@@ -269,22 +269,42 @@ func step_lif_plus(dt: float) -> int:
 
 
 func read_motor_channels(count: int) -> PackedFloat32Array:
+	## map_motor packing: [forward | vertical | yaw_L | pitch | yaw_R]
+	## yaw = mean(yaw_L) - mean(yaw_R)
 	var out := PackedFloat32Array()
 	out.resize(count)
 	if map_motor.is_empty():
 		return out
-	var chunk := maxi(1, int(floor(float(map_motor.size()) / float(count))))
+	var chunk := maxi(1, int(floor(float(map_motor.size()) / float(maxi(count, 1)))))
+	var fwd := _mean_motor_range(0, mini(map_motor.size(), chunk))
+	var vert := _mean_motor_range(chunk, mini(map_motor.size(), 2 * chunk))
+	var yaw_l := _mean_motor_range(2 * chunk, mini(map_motor.size(), 3 * chunk))
+	var pitch := _mean_motor_range(3 * chunk, mini(map_motor.size(), 4 * chunk))
+	var yaw_r := _mean_motor_range(4 * chunk, map_motor.size())
+	var vals := [
+		fwd,
+		vert,
+		yaw_l - yaw_r,
+		pitch,
+		(yaw_l + yaw_r) * 0.2,
+	]
 	for c in count:
-		var start := c * chunk
-		var stop := mini(map_motor.size(), start + chunk) if c < count - 1 else map_motor.size()
-		var acc := 0.0
-		var n := 0
-		for i in range(start, stop):
-			var ni: int = map_motor[i]
-			acc += v[ni] + 0.25 * i_syn[ni]
-			n += 1
-		out[c] = tanh(acc / float(maxi(n, 1)))
+		out[c] = tanh(vals[c] if c < vals.size() else 0.0)
 	return out
+
+
+func _mean_motor_range(start: int, stop: int) -> float:
+	if start >= stop:
+		return 0.0
+	var acc := 0.0
+	var n := 0
+	for i in range(start, stop):
+		var ni: int = map_motor[i]
+		if ni < 0 or ni >= n_neurons:
+			continue
+		acc += v[ni] + 0.35 * (i_syn[ni] if ni < i_syn.size() else 0.0)
+		n += 1
+	return acc / float(maxi(n, 1))
 
 
 func load_from_json(path: String) -> Error:

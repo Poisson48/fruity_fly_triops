@@ -36,14 +36,14 @@ const LOP_MISC := 112
 
 
 class Gains:
-	var food: float = 1.6
-	var wall: float = 2.4
-	var mate: float = 0.85
-	var tonic: float = 0.06
-	var conflict: float = 0.7
-	var contra: float = 1.25
-	var flow: float = 1.1
-	var expand: float = 1.35
+	var food: float = 1.7
+	var wall: float = 2.75
+	var mate: float = 0.95
+	var tonic: float = 0.05
+	var conflict: float = 0.75
+	var contra: float = 1.35
+	var flow: float = 1.25
+	var expand: float = 1.55
 
 
 static func gains_from_genome(genome: BrainGenome) -> Gains:
@@ -109,11 +109,12 @@ static func _apply_me(
 ) -> void:
 	_inject_field(network, ids, ME_ON, on_f, g.food)
 	_inject_field(network, ids, ME_OFF, off_f, g.wall)
-	_inject_field(network, ids, ME_HS, _abs_field(flow_h), g.flow)
-	_inject_field(network, ids, ME_VS, _abs_field(flow_v), g.flow)
+	# Signed optic flow so L/R HS asymmetry can reach SEZ yaw pools.
+	_inject_field(network, ids, ME_HS, _signed_field(flow_h), g.flow)
+	_inject_field(network, ids, ME_VS, _signed_field(flow_v), g.flow)
 	_inject_uniform(network, ids, ME_EXP, 8, expand * g.expand)
-	_inject_uniform(network, ids, ME_EXP + 8, 8, contrast * g.flow * 0.8)
-	_inject_field(network, ids, ME_MISC, mate_f, g.mate * 0.6)
+	_inject_uniform(network, ids, ME_EXP + 8, 8, contrast * g.flow * 0.85)
+	_inject_field(network, ids, ME_MISC, mate_f, g.mate * 0.85)
 
 
 static func _apply_me_gpu(
@@ -131,31 +132,33 @@ static func _apply_me_gpu(
 ) -> void:
 	engine.inject_weights(slot, ids, ME_ON, on_f, g.food)
 	engine.inject_weights(slot, ids, ME_OFF, off_f, g.wall)
-	engine.inject_weights(slot, ids, ME_HS, _abs_field(flow_h), g.flow)
-	engine.inject_weights(slot, ids, ME_VS, _abs_field(flow_v), g.flow)
+	engine.inject_weights(slot, ids, ME_HS, _signed_field(flow_h), g.flow)
+	engine.inject_weights(slot, ids, ME_VS, _signed_field(flow_v), g.flow)
 	engine.inject_range(slot, ids, ME_EXP, 8, expand * g.expand)
-	engine.inject_range(slot, ids, ME_EXP + 8, 8, contrast * g.flow * 0.8)
-	engine.inject_weights(slot, ids, ME_MISC, mate_f, g.mate * 0.6)
+	engine.inject_range(slot, ids, ME_EXP + 8, 8, contrast * g.flow * 0.85)
+	engine.inject_weights(slot, ids, ME_MISC, mate_f, g.mate * 0.85)
 
 
 static func _apply_lop(network: NeuralNetwork, ids: PackedInt32Array, packet: SensoryPacket, g: Gains) -> void:
 	_inject_field(network, ids, LOP_ON, packet.median_on, g.food * 0.85)
 	_inject_field(network, ids, LOP_OFF, packet.median_off, g.wall * 1.05)
-	# Binocular HS into LOP: signed yaw flow + L/R loom imbalance.
 	var hs := PackedFloat32Array()
 	hs.resize(16)
 	var yaw := packet.flow_yaw
+	var loom_lr := _ch(packet.left_eye, 0) - _ch(packet.right_eye, 0)
 	for i in 16:
 		var t := (float(i) / 15.0) * 2.0 - 1.0
-		hs[i] = absf(yaw) * (0.55 + 0.45 * absf(t)) + absf(_ch(packet.left_eye, 0) - _ch(packet.right_eye, 0)) * 0.4
+		# Signed: negative t ← left, positive t ← right.
+		hs[i] = yaw * (0.35 + 0.65 * t) + loom_lr * (0.25 + 0.35 * t)
 	_inject_field(network, ids, LOP_HS, hs, g.flow)
 	var vs := PackedFloat32Array()
 	vs.resize(16)
 	var pitch := packet.flow_pitch
 	for i in 16:
-		vs[i] = absf(pitch) * (0.5 + 0.5 * float(i) / 15.0)
+		var t := (float(i) / 15.0) * 2.0 - 1.0
+		vs[i] = pitch * (0.4 + 0.6 * t)
 	_inject_field(network, ids, LOP_VS, vs, g.flow)
-	var exp_v := maxf(packet.expand_m, maxf(packet.expand_l, packet.expand_r) * 0.7)
+	var exp_v := maxf(packet.expand_m, maxf(packet.expand_l, packet.expand_r) * 0.75)
 	_inject_uniform(network, ids, LOP_EXP, 32, exp_v * g.expand)
 	_inject_field(network, ids, LOP_MATE, packet.median_mate, g.mate)
 	var conflict := (
@@ -173,17 +176,19 @@ static func _apply_lop_gpu(engine: GpuLifEngine, slot: int, packet: SensoryPacke
 	var hs := PackedFloat32Array()
 	hs.resize(16)
 	var yaw := packet.flow_yaw
+	var loom_lr := _ch(packet.left_eye, 0) - _ch(packet.right_eye, 0)
 	for i in 16:
 		var t := (float(i) / 15.0) * 2.0 - 1.0
-		hs[i] = absf(yaw) * (0.55 + 0.45 * absf(t)) + absf(_ch(packet.left_eye, 0) - _ch(packet.right_eye, 0)) * 0.4
+		hs[i] = yaw * (0.35 + 0.65 * t) + loom_lr * (0.25 + 0.35 * t)
 	engine.inject_weights(slot, ids, LOP_HS, hs, g.flow)
 	var vs := PackedFloat32Array()
 	vs.resize(16)
 	var pitch := packet.flow_pitch
 	for i in 16:
-		vs[i] = absf(pitch) * (0.5 + 0.5 * float(i) / 15.0)
+		var t := (float(i) / 15.0) * 2.0 - 1.0
+		vs[i] = pitch * (0.4 + 0.6 * t)
 	engine.inject_weights(slot, ids, LOP_VS, vs, g.flow)
-	var exp_v := maxf(packet.expand_m, maxf(packet.expand_l, packet.expand_r) * 0.7)
+	var exp_v := maxf(packet.expand_m, maxf(packet.expand_l, packet.expand_r) * 0.75)
 	engine.inject_range(slot, ids, LOP_EXP, 32, exp_v * g.expand)
 	engine.inject_weights(slot, ids, LOP_MATE, packet.median_mate, g.mate)
 	var conflict := (
@@ -221,6 +226,15 @@ static func _inject_uniform(network: NeuralNetwork, ids: PackedInt32Array, offse
 			continue
 		network.i_syn[ni] += amp
 		network._activate(ni)
+
+
+static func _signed_field(field: PackedFloat32Array) -> PackedFloat32Array:
+	## Pass through signed flow; clamp so inject stays stable.
+	var out := PackedFloat32Array()
+	out.resize(field.size())
+	for i in field.size():
+		out[i] = clampf(field[i], -1.5, 1.5)
+	return out
 
 
 static func _abs_field(field: PackedFloat32Array) -> PackedFloat32Array:

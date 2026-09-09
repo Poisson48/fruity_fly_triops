@@ -124,7 +124,7 @@ func setup(template: NeuralNetwork, p_max_agents: int) -> bool:
 	map_right = template.map_right
 	map_median = template.map_median
 	map_motor = template.map_motor
-	drive_gain = template.drive_gain * 1.25
+	drive_gain = template.drive_gain * 1.3
 	syn_scale = template.syn_scale
 	v_thresh = template.v_thresh
 	tau_mem = template.tau_mem
@@ -200,7 +200,10 @@ func setup(template: NeuralNetwork, p_max_agents: int) -> bool:
 	_set_inject = _make_set(_shader_inject, [_i_rid, _drive_rid, _p_inj])
 	_set_integrate = _make_set(_shader_integrate, [_v_rid, _i_rid, _r_rid, _s_rid, _p_int])
 	_set_synapse = _make_set(_shader_synapse, [_i_rid, _s_rid, _off_rid, _tgt_rid, _w_rid, _p_syn])
-	_set_motor = _make_set(_shader_motor, [_v_rid, _motor_map_rid, _motor_out_rid, _spike_count_rid, _s_rid, _p_mot])
+	_set_motor = _make_set(
+		_shader_motor,
+		[_v_rid, _motor_map_rid, _motor_out_rid, _spike_count_rid, _s_rid, _i_rid, _p_mot]
+	)
 	if not (
 		_set_inject.is_valid()
 		and _set_integrate.is_valid()

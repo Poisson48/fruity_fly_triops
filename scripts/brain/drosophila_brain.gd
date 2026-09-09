@@ -67,28 +67,28 @@ func _ensure_interface_genes(rng: RandomNumberGenerator) -> void:
 		genome.randomize_genes(rng, 0.12)
 		return
 	if genome.sense_gains.size() < 6:
-		genome.sense_gains = PackedFloat32Array([1.35, 1.55, 0.7, 0.05, 0.55, 0.95, 1.1, 1.35])
+		genome.sense_gains = PackedFloat32Array([1.45, 2.35, 0.65, 0.04, 0.5, 1.2, 1.15, 1.55])
 	elif genome.sense_gains.size() < 8:
 		var sg := genome.sense_gains.duplicate()
 		while sg.size() < 8:
-			sg.append(1.1 if sg.size() == 6 else 1.35)
+			sg.append(1.15 if sg.size() == 6 else 1.55)
 		genome.sense_gains = sg
-	if genome.interface_mix <= 0.0 or genome.interface_mix > 0.35:
-		genome.interface_mix = 0.12
+	if genome.interface_mix <= 0.0 or genome.interface_mix > 0.2:
+		genome.interface_mix = 0.06
 	if genome.forward_tonic < 0.02:
-		genome.forward_tonic = 0.08
+		genome.forward_tonic = 0.05
 	if genome.chemotaxis <= 0.0:
-		genome.chemotaxis = 0.65
+		genome.chemotaxis = 0.35
 	if genome.mate_taxis <= 0.0:
-		genome.mate_taxis = 0.55
+		genome.mate_taxis = 0.45
 	if genome.wall_taxis <= 0.0:
-		genome.wall_taxis = 1.15
+		genome.wall_taxis = 0.55
 	if genome.wall_brake <= 0.0:
-		genome.wall_brake = 0.95
+		genome.wall_brake = 0.5
 	if genome.vertical_amp <= 0.0:
-		genome.vertical_amp = 0.85
+		genome.vertical_amp = 0.55
 	if genome.pitch_amp <= 0.0:
-		genome.pitch_amp = 0.7
+		genome.pitch_amp = 0.45
 
 
 func prepare_gpu_drive(packet: SensoryPacket) -> void:
@@ -146,8 +146,8 @@ func _blend_interface(packet: SensoryPacket, raw: PackedFloat32Array) -> PackedF
 	out.resize(MotorInterface.CHANNEL_COUNT)
 	var flat := packet.as_flat()
 	# Prefer FlyWire motor readout; tiny adapter only.
-	var mix := genome.interface_mix if genome else 0.12
-	mix = clampf(mix, 0.0, 0.35)
+	var mix := genome.interface_mix if genome else 0.06
+	mix = clampf(mix, 0.0, 0.2)
 	var in_n := genome.input_count if genome else 9
 	for o in MotorInterface.CHANNEL_COUNT:
 		var adapter: float = genome.bias[o] if genome and o < genome.bias.size() else 0.0
@@ -160,8 +160,16 @@ func _blend_interface(packet: SensoryPacket, raw: PackedFloat32Array) -> PackedF
 		var gain: float = genome.motor_gains[o] if genome and o < genome.motor_gains.size() else 1.0
 		out[o] = clampf(blended * gain, -1.0, 1.0)
 
-	# Soft safety assists only — most steering should come from FlyWire.
-	const ASSIST := 0.16
+	# Soft residual assists — only fill in when the connectome is quiet.
+	const ASSIST := 0.06
+	var brain_energy := (
+		absf(raw[0] if raw.size() > 0 else 0.0)
+		+ absf(raw[1] if raw.size() > 1 else 0.0)
+		+ absf(raw[2] if raw.size() > 2 else 0.0)
+		+ absf(raw[3] if raw.size() > 3 else 0.0)
+	)
+	var brain_gate := clampf(1.0 - brain_energy * 2.2, 0.15, 1.0)
+	var assist := ASSIST * brain_gate
 	var wall_l := flat[0] if flat.size() > 0 else 0.0
 	var food_l := flat[1] if flat.size() > 1 else 0.0
 	var mate_l := flat[2] if flat.size() > 2 else 0.0
@@ -171,10 +179,10 @@ func _blend_interface(packet: SensoryPacket, raw: PackedFloat32Array) -> PackedF
 	var wall_m := flat[6] if flat.size() > 6 else 0.0
 	var food_m := flat[7] if flat.size() > 7 else 0.0
 	var mate_m := flat[8] if flat.size() > 8 else 0.0
-	var chemo: float = (genome.chemotaxis if genome else 0.65) * ASSIST
-	var mtax: float = (genome.mate_taxis if genome else 0.55) * ASSIST
-	var wtax: float = (genome.wall_taxis if genome else 1.15) * ASSIST * 1.2
-	var wbrake: float = (genome.wall_brake if genome else 0.95) * ASSIST
+	var chemo: float = (genome.chemotaxis if genome else 0.35) * assist
+	var mtax: float = (genome.mate_taxis if genome else 0.45) * assist
+	var wtax: float = (genome.wall_taxis if genome else 0.55) * assist
+	var wbrake: float = (genome.wall_brake if genome else 0.5) * assist
 	var food_sum := food_l + food_r + food_m
 	var mate_sum := mate_l + mate_r + mate_m
 	var wall_max := maxf(wall_m, maxf(wall_l, wall_r))
@@ -184,30 +192,30 @@ func _blend_interface(packet: SensoryPacket, raw: PackedFloat32Array) -> PackedF
 		+ (food_l - food_r) * chemo
 		+ (mate_l - mate_r) * mtax
 		+ (wall_r - wall_l) * wtax
-		+ packet.flow_yaw * ASSIST * 0.55
-		+ (packet.expand_r - packet.expand_l) * wtax * 0.35,
+		+ packet.flow_yaw * assist * 0.4
+		+ (packet.expand_r - packet.expand_l) * wtax * 0.3,
 		-1.0,
 		1.0
 	)
 	var brake := (wall_m * 1.0 + maxf(wall_l, wall_r) * 0.4 + expand_max * 0.55) * wbrake
 	out[MotorInterface.CHANNEL_FORWARD] = clampf(
-		out[MotorInterface.CHANNEL_FORWARD] + food_sum * 0.03 * ASSIST + mate_sum * 0.02 * ASSIST - brake,
+		out[MotorInterface.CHANNEL_FORWARD] + food_sum * 0.02 * assist + mate_sum * 0.015 * assist - brake,
 		-1.0,
 		1.0
 	)
-	var tonic: float = (genome.forward_tonic if genome else 0.08) * (1.0 - maxf(wall_max, expand_max) * 0.8)
+	var tonic: float = (genome.forward_tonic if genome else 0.05) * (1.0 - maxf(wall_max, expand_max) * 0.8)
 	out[MotorInterface.CHANNEL_FORWARD] = clampf(out[MotorInterface.CHANNEL_FORWARD] + tonic, -1.0, 1.0)
 
-	var vamp: float = (genome.vertical_amp if genome else 0.85) * ASSIST
-	var pamp: float = (genome.pitch_amp if genome else 0.7) * ASSIST
+	var vamp: float = (genome.vertical_amp if genome else 0.55) * assist
+	var pamp: float = (genome.pitch_amp if genome else 0.45) * assist
 	var food_v := packet.food_up - packet.food_down
 	var mate_v := packet.mate_up - packet.mate_down
 	out[MotorInterface.CHANNEL_VERTICAL] = clampf(
 		out[MotorInterface.CHANNEL_VERTICAL]
 		+ food_v * vamp
 		+ mate_v * vamp * 0.5
-		+ (packet.ceiling_loom - packet.floor_loom) * ASSIST * 0.7
-		+ packet.flow_pitch * ASSIST * 0.4,
+		+ (packet.ceiling_loom - packet.floor_loom) * assist * 0.55
+		+ packet.flow_pitch * assist * 0.35,
 		-1.0,
 		1.0
 	)
@@ -215,8 +223,8 @@ func _blend_interface(packet: SensoryPacket, raw: PackedFloat32Array) -> PackedF
 		out[MotorInterface.CHANNEL_PITCH]
 		+ food_v * pamp
 		+ mate_v * pamp * 0.4
-		+ (packet.ceiling_loom - packet.floor_loom) * ASSIST * 0.45
-		+ packet.flow_pitch * ASSIST * 0.35,
+		+ (packet.ceiling_loom - packet.floor_loom) * assist * 0.35
+		+ packet.flow_pitch * assist * 0.3,
 		-1.0,
 		1.0
 	)
@@ -333,5 +341,5 @@ func get_debug_info() -> Dictionary:
 		"backend": "gpu" if use_gpu else "cpu",
 		"generation": genome.generation if genome else 0,
 		"interface_mix": genome.interface_mix if genome else 0.0,
-		"note": "FlyWire-led LIF+ (assist %.0f%%)" % (clampf(genome.interface_mix if genome else 0.12, 0, 1) * 100.0),
+		"note": "FlyWire-led LIF+ (adapter %.0f%%, assist gated)" % (clampf(genome.interface_mix if genome else 0.06, 0, 1) * 100.0),
 	}

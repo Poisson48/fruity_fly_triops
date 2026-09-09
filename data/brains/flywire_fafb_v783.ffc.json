@@ -14,8 +14,32 @@
       "left": "primary neuropil ME_L/LO_L (experimental Triops\u2192fly visual interface)",
       "right": "primary neuropil ME_R/LO_R",
       "median": "primary neuropil LOP_*",
-      "motor": "GNG/SAD/\u2026 or top out-degree",
-      "note": "Mapping uses real FlyWire neuropil anatomy; Triops\u2260Drosophila eyes."
+      "motor": "SEZ (GNG/SAD/AMMC/PRW/FLA/IPS/LAL/VES) ranked by in-weight from ME/LO/LOP; packed [forward|vertical|yaw_L|pitch|yaw_R] for L\u2212R yaw readout",
+      "note": "Uses real FlyWire neuropil anatomy as Triops\u2194fly interface scaffold; not validated descending neuron IDs (DNp).",
+      "motor_count": 80,
+      "motor_layout": {
+        "forward": [
+          0,
+          16
+        ],
+        "vertical": [
+          16,
+          32
+        ],
+        "yaw_L": [
+          32,
+          48
+        ],
+        "pitch": [
+          48,
+          64
+        ],
+        "yaw_R": [
+          64,
+          80
+        ],
+        "yaw_channel": "mean(yaw_L) - mean(yaw_R)"
+      }
     },
     "dynamics_note": "Topology only \u2014 dynamics implemented in simulator (LIF+)."
   }

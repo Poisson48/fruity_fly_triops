@@ -138,11 +138,13 @@ def main() -> None:
     left = collect(("ME_L", "LO_L"), 256)
     right = collect(("ME_R", "LO_R"), 256)
     median = collect(("LOP_L", "LOP_R"), 256)
-    motor = collect(("GNG", "SAD"), 128)
+    # Prefer rebuild_motor_map.py after binary write for SEZ+visual in-degree packing.
+    motor = collect(("GNG", "SAD", "AMMC", "PRW", "FLA", "IPS"), 128)
     if len(motor) < 32:
         deg = sorted(range(n), key=lambda i: offsets[i + 1] - offsets[i], reverse=True)
         motor = deg[:128]
     print(f"map L={len(left)} R={len(right)} M={len(median)} motor={len(motor)}")
+    print("Tip: run tools/rebuild_motor_map.py on the .ffc for yaw L/R packing.")
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("wb") as f:
