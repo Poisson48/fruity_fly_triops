@@ -1,0 +1,144 @@
+[gd_scene load_steps=12 format=3]
+
+[ext_resource type="Script" path="res://scripts/simulation/main.gd" id="1_main"]
+[ext_resource type="Script" path="res://scripts/simulation/simulation_config.gd" id="2_cfg"]
+[ext_resource type="Script" path="res://scripts/rendering/aquarium_visual.gd" id="3_aq"]
+[ext_resource type="Script" path="res://scripts/rendering/triops_visual.gd" id="4_tv"]
+[ext_resource type="Script" path="res://scripts/rendering/free_camera.gd" id="5_cam"]
+[ext_resource type="Script" path="res://scripts/debug/debug_ui.gd" id="6_dbg"]
+[ext_resource type="Script" path="res://scripts/rendering/food_visual.gd" id="7_food"]
+[ext_resource type="Script" path="res://scripts/rendering/egg_visual.gd" id="8_egg"]
+[ext_resource type="Script" path="res://scripts/debug/brain_viz.gd" id="9_brain"]
+
+[sub_resource type="Resource" id="SimulationConfig_default"]
+script = ExtResource("2_cfg")
+seed = 12345
+triops_count = 30
+max_triops = 120
+aquarium_half_extents = Vector3(20, 10, 20)
+simulation_dt = 0.0166667
+seconds_per_sim_day = 45.0
+food_count = 140
+energy_drain_per_second = 0.01
+brain_type = "test"
+
+[sub_resource type="Environment" id="Environment_bg"]
+background_mode = 1
+background_color = Color(0.05, 0.07, 0.1, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.4, 0.45, 0.5, 1)
+ambient_light_energy = 0.6
+
+[node name="Main" type="Node3D"]
+script = ExtResource("1_main")
+config = SubResource("SimulationConfig_default")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_bg")
+
+[node name="Aquarium" type="Node3D" parent="."]
+script = ExtResource("3_aq")
+
+[node name="FoodVisual" type="MultiMeshInstance3D" parent="."]
+script = ExtResource("7_food")
+
+[node name="EggVisual" type="MultiMeshInstance3D" parent="."]
+script = ExtResource("8_egg")
+
+[node name="TriopsVisual" type="MultiMeshInstance3D" parent="."]
+script = ExtResource("4_tv")
+
+[node name="Camera3D" type="Camera3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 0.939693, 0.34202, 0, -0.34202, 0.939693, 0, 8, 28)
+current = true
+script = ExtResource("5_cam")
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.866025, -0.353553, 0.353553, 0, 0.707107, 0.707107, -0.5, -0.612372, 0.612372, 0, 20, 0)
+light_energy = 0.9
+
+[node name="DebugUI" type="CanvasLayer" parent="."]
+script = ExtResource("6_dbg")
+
+[node name="Panel" type="PanelContainer" parent="DebugUI"]
+offset_left = 12.0
+offset_top = 12.0
+offset_right = 520.0
+offset_bottom = 560.0
+
+[node name="Margin" type="MarginContainer" parent="DebugUI/Panel"]
+layout_mode = 2
+theme_override_constants/margin_left = 10
+theme_override_constants/margin_top = 8
+theme_override_constants/margin_right = 10
+theme_override_constants/margin_bottom = 8
+
+[node name="VBox" type="VBoxContainer" parent="DebugUI/Panel/Margin"]
+layout_mode = 2
+theme_override_constants/separation = 8
+
+[node name="Controls" type="HBoxContainer" parent="DebugUI/Panel/Margin/VBox"]
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="SlowerBtn" type="Button" parent="DebugUI/Panel/Margin/VBox/Controls"]
+layout_mode = 2
+text = "<<"
+
+[node name="PauseBtn" type="Button" parent="DebugUI/Panel/Margin/VBox/Controls"]
+layout_mode = 2
+text = "Pause"
+
+[node name="FasterBtn" type="Button" parent="DebugUI/Panel/Margin/VBox/Controls"]
+layout_mode = 2
+text = ">>"
+
+[node name="MenuBtn" type="Button" parent="DebugUI/Panel/Margin/VBox/Controls"]
+layout_mode = 2
+text = "Menu"
+
+[node name="SpeedLabel" type="Label" parent="DebugUI/Panel/Margin/VBox/Controls"]
+layout_mode = 2
+text = "1.00x"
+
+[node name="Label" type="Label" parent="DebugUI/Panel/Margin/VBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 12
+text = "Debug"
+
+[node name="BrainPanel" type="PanelContainer" parent="DebugUI"]
+anchors_preset = 1
+anchor_left = 1.0
+anchor_right = 1.0
+offset_left = -360.0
+offset_top = 12.0
+offset_right = -12.0
+offset_bottom = 720.0
+grow_horizontal = 0
+script = ExtResource("9_brain")
+
+[node name="Margin" type="MarginContainer" parent="DebugUI/BrainPanel"]
+layout_mode = 2
+theme_override_constants/margin_left = 10
+theme_override_constants/margin_top = 8
+theme_override_constants/margin_right = 10
+theme_override_constants/margin_bottom = 8
+
+[node name="VBox" type="VBoxContainer" parent="DebugUI/BrainPanel/Margin"]
+layout_mode = 2
+theme_override_constants/separation = 6
+
+[node name="Title" type="Label" parent="DebugUI/BrainPanel/Margin/VBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 15
+text = "Cerveau FlyWire"
+
+[node name="Stats" type="Label" parent="DebugUI/BrainPanel/Margin/VBox"]
+layout_mode = 2
+theme_override_font_sizes/font_size = 11
+text = "en attente…"
+
+[node name="Canvas" type="Control" parent="DebugUI/BrainPanel/Margin/VBox"]
+custom_minimum_size = Vector2(300, 560)
+layout_mode = 2
+size_flags_vertical = 3

@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://c82vi36s3kyek"
+path="res://.godot/imported/lif_integrate.glsl-0c44f2ece55ca4f6e97826f95805500e.res"
+
+[deps]
+
+source_file="res://shaders/lif_integrate.glsl"
+dest_files=["res://.godot/imported/lif_integrate.glsl-0c44f2ece55ca4f6e97826f95805500e.res"]
+
+[params]
+

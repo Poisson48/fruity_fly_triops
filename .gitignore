@@ -1,0 +1,13 @@
+# Godot 4
+.godot/
+*.translation
+export.cfg
+export_presets.cfg
+*.tmp
+*~
+ressources/*.csv
+ressources/*.csv.gz
+ressources/*.feather
+
+# Local debug traces / smoke outputs
+data/debug/

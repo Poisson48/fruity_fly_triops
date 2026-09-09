@@ -1,0 +1,28 @@
+{
+  "provenance": {
+    "kind": "scaffold",
+    "description": "NOT biological Drosophila data. Pipeline / format example only.",
+    "note": "Import a real connectome with tools/import_connectome_csv.py and set provenance.kind to flywire|hemibrain|neuprint plus dataset/citation."
+  },
+  "neurons": [
+    {"id": 0},
+    {"id": 1},
+    {"id": 2},
+    {"id": 3},
+    {"id": 4},
+    {"id": 5},
+    {"id": 6},
+    {"id": 7}
+  ],
+  "connections": [
+    {"source": 0, "target": 3, "weight": 0.5},
+    {"source": 1, "target": 4, "weight": 0.5},
+    {"source": 2, "target": 5, "weight": 0.4},
+    {"source": 3, "target": 6, "weight": 0.3},
+    {"source": 4, "target": 6, "weight": -0.2},
+    {"source": 5, "target": 7, "weight": 0.35},
+    {"source": 6, "target": 7, "weight": 0.25}
+  ],
+  "input_neuron_ids": [0, 1, 2, 0, 1, 2, 0, 1, 2],
+  "output_neuron_ids": [3, 4, 5, 6, 7]
+}

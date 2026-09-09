@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://dqi57lno72dac"
+path="res://.godot/imported/lif_motor.glsl-210175a9759ccd72e898b14efc9ccc56.res"
+
+[deps]
+
+source_file="res://shaders/lif_motor.glsl"
+dest_files=["res://.godot/imported/lif_motor.glsl-210175a9759ccd72e898b14efc9ccc56.res"]
+
+[params]
+

@@ -1,0 +1,22 @@
+{
+  "provenance": {
+    "kind": "flywire",
+    "dataset": "flywire_fafb_v783_connections_princeton",
+    "citation": "Dorkenwald et al., Nature 2024; FlyWire Codex connections_princeton",
+    "source_file": "ressources/connections_princeton.csv.gz",
+    "min_synapses": 5,
+    "neuron_count": 110206,
+    "synapse_count": 3754052,
+    "neuropil_count": 79,
+    "binary": "data/brains/flywire_fafb_v783.ffc",
+    "format": "FFC1",
+    "eye_mapping": {
+      "left": "primary neuropil ME_L/LO_L (experimental Triops\u2192fly visual interface)",
+      "right": "primary neuropil ME_R/LO_R",
+      "median": "primary neuropil LOP_*",
+      "motor": "GNG/SAD/\u2026 or top out-degree",
+      "note": "Mapping uses real FlyWire neuropil anatomy; Triops\u2260Drosophila eyes."
+    },
+    "dynamics_note": "Topology only \u2014 dynamics implemented in simulator (LIF+)."
+  }
+}

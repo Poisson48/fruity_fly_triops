@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://fpsrunner001"]
+
+[ext_resource type="Script" path="res://scripts/debug/fps_runner_persist.gd" id="1_persist"]
+
+[node name="FpsKeeper" type="Node"]
+script = ExtResource("1_persist")

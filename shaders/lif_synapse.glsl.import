@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cre18uy4empvb"
+path="res://.godot/imported/lif_synapse.glsl-731454507452139cc5ffe37a2b868f56.res"
+
+[deps]
+
+source_file="res://shaders/lif_synapse.glsl"
+dest_files=["res://.godot/imported/lif_synapse.glsl-731454507452139cc5ffe37a2b868f56.res"]
+
+[params]
+
