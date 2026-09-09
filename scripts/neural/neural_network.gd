@@ -282,10 +282,10 @@ func read_motor_channels(count: int) -> PackedFloat32Array:
 	var pitch := _mean_motor_range(3 * chunk, mini(map_motor.size(), 4 * chunk))
 	var yaw_r := _mean_motor_range(4 * chunk, map_motor.size())
 	var vals := [
-		fwd,
-		vert,
-		yaw_l - yaw_r,
-		pitch,
+		fwd * 1.5,
+		vert * 1.25,
+		(yaw_l - yaw_r) * 2.2,
+		pitch * 1.2,
 		(yaw_l + yaw_r) * 0.2,
 	]
 	for c in count:

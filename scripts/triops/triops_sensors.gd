@@ -116,6 +116,24 @@ func sense(
 	packet.mate_up = _mate_hemisphere(position, Vector3.UP, mates, mate_radius)
 	packet.mate_down = _mate_hemisphere(position, Vector3.DOWN, mates, mate_radius)
 
+	# Explicit nearest-target bearings — also bias ON mosaics so LIF sees L/R food.
+	if food != null and not food_near.is_empty():
+		var bear := _nearest_bearing(position, orientation, food, food_near, food_radius)
+		packet.food_bearing_yaw = bear.x
+		packet.food_bearing_strength = bear.y
+		if packet.food_bearing_strength > 0.08 and absf(packet.food_bearing_yaw) > 0.04:
+			var nudge := packet.food_bearing_yaw * packet.food_bearing_strength * 0.65
+			if packet.left_eye.size() > 1:
+				packet.left_eye[1] = minf(packet.left_eye[1] + maxf(nudge, 0.0), 3.5)
+			if packet.right_eye.size() > 1:
+				packet.right_eye[1] = minf(packet.right_eye[1] + maxf(-nudge, 0.0), 3.5)
+			# Drive the connectome, not just the adapter summaries.
+			_bias_on_mosaic(packet.left_on, maxf(nudge, 0.0) * 0.85)
+			_bias_on_mosaic(packet.right_on, maxf(-nudge, 0.0) * 0.85)
+	if not mates.is_empty():
+		var mb := _nearest_mate_bearing(position, orientation, mates, mate_radius)
+		packet.mate_bearing_yaw = mb.x
+
 	_prev_left_depth = L.depth
 	_prev_right_depth = R.depth
 	_prev_median_depth = M.depth
@@ -394,6 +412,73 @@ func _mate_hemisphere(origin: Vector3, axis: Vector3, mates: Array[Vector3], rad
 			continue
 		best = maxf(best, align * (1.0 - dist / radius))
 	return best
+
+
+func _bias_on_mosaic(on: PackedFloat32Array, amount: float) -> void:
+	if amount <= 0.001 or on.is_empty():
+		return
+	for i in on.size():
+		# Prefer outer azimuth columns (every AZ facets) for a sharper L/R drive.
+		var az := i % AZ
+		var col_w := 0.55 + 0.9 * (float(az) / float(maxi(AZ - 1, 1)))
+		on[i] = minf(on[i] + amount * col_w, 3.5)
+
+
+func _nearest_bearing(
+	origin: Vector3,
+	orientation: Basis,
+	food: FoodSystem,
+	candidates: PackedInt32Array,
+	radius: float
+) -> Vector2:
+	## x = yaw cmd bias (+ left), y = strength 0..1
+	var best_i := -1
+	var best_d2 := radius * radius
+	for idx in candidates:
+		if idx < 0 or idx >= food.positions.size() or food.active[idx] == 0:
+			continue
+		var d2 := origin.distance_squared_to(food.positions[idx])
+		if d2 < best_d2:
+			best_d2 = d2
+			best_i = idx
+	if best_i < 0:
+		return Vector2.ZERO
+	var local: Vector3 = orientation.inverse() * (food.positions[best_i] - origin)
+	var fwd := -local.z
+	var right := local.x
+	# Only steer to food in the frontal field — behind-target taxis looks stupid / walls pin.
+	if fwd < 0.15:
+		return Vector2.ZERO
+	var ang := atan2(right, maxf(fwd, 0.08))
+	var dist := sqrt(best_d2)
+	var strength := clampf(1.0 - dist / maxf(radius, 0.01), 0.0, 1.0)
+	strength *= clampf(fwd / maxf(dist, 0.01), 0.0, 1.0)
+	# Positive motor yaw turns left; food to the right (ang>0) → negative yaw.
+	var yaw := clampf(-ang / (PI * 0.55), -1.5, 1.5) * strength
+	return Vector2(yaw, strength)
+
+
+func _nearest_mate_bearing(
+	origin: Vector3,
+	orientation: Basis,
+	mates: Array[Vector3],
+	radius: float
+) -> Vector2:
+	var best_d2 := radius * radius
+	var best := Vector3.ZERO
+	var found := false
+	for mpos in mates:
+		var d2 := origin.distance_squared_to(mpos)
+		if d2 < best_d2 and d2 > 0.0001:
+			best_d2 = d2
+			best = mpos
+			found = true
+	if not found:
+		return Vector2.ZERO
+	var local: Vector3 = orientation.inverse() * (best - origin)
+	var ang := atan2(local.x, maxf(-local.z, 0.08))
+	var strength := clampf(1.0 - sqrt(best_d2) / maxf(radius, 0.01), 0.0, 1.0)
+	return Vector2(clampf(-ang / (PI * 0.55), -1.5, 1.5) * strength, strength)
 
 
 func _wall_depth_norm(origin: Vector3, direction: Vector3, half: Vector3, ray_length: float) -> float:

@@ -49,6 +49,10 @@ var food_up: float = 0.0
 var food_down: float = 0.0
 var mate_up: float = 0.0
 var mate_down: float = 0.0
+## Body-frame bearing: + = turn left toward target (matches motor yaw sign).
+var food_bearing_yaw: float = 0.0
+var mate_bearing_yaw: float = 0.0
+var food_bearing_strength: float = 0.0
 
 
 func as_flat() -> PackedFloat32Array:

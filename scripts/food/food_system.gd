@@ -74,10 +74,14 @@ func _rebuild_grid() -> void:
 	_grid_dirty = false
 
 
-## Indices of active food within radius (axis-aligned cell neighborhood).
-func nearby_indices(origin: Vector3, radius: float) -> PackedInt32Array:
+func prepare_queries() -> void:
 	if _grid_dirty:
 		_rebuild_grid()
+
+
+## Indices of active food within radius (axis-aligned cell neighborhood).
+## Call prepare_queries() on the main thread before parallel reads.
+func nearby_indices(origin: Vector3, radius: float) -> PackedInt32Array:
 	var out := PackedInt32Array()
 	var r_cells := int(ceil(radius / CELL))
 	var c := _cell_key(origin)

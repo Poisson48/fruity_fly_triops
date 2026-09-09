@@ -127,7 +127,7 @@ func setup(template: NeuralNetwork, p_max_agents: int) -> bool:
 	map_right = template.map_right
 	map_median = template.map_median
 	map_motor = template.map_motor
-	drive_gain = template.drive_gain * 1.3
+	drive_gain = template.drive_gain * 1.55
 	syn_scale = template.syn_scale
 	v_thresh = template.v_thresh
 	tau_mem = template.tau_mem

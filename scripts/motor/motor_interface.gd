@@ -23,9 +23,9 @@ var channel_map: PackedInt32Array = PackedInt32Array()
 ## Scales applied after mapping.
 var thrust_scale: float = 1.0
 var vertical_scale: float = 1.35
-var yaw_scale: float = 1.0
-var pitch_scale: float = 1.3
-var roll_scale: float = 0.85
+var yaw_scale: float = 1.55
+var pitch_scale: float = 1.35
+var roll_scale: float = 0.55
 
 
 class MotorCommand:

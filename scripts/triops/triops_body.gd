@@ -62,10 +62,10 @@ func _keep_inside(config: SimulationConfig) -> void:
 			bounced = true
 
 	if bounced and velocity.length_squared() > 0.0001:
-		# After bounce, face more along rebound so we don't immediately re-hit.
+		# Gentle reorient after bounce — avoid teleport-facing that looks random.
 		var desired := velocity.normalized()
 		var current_fwd := -orientation.z
-		var blended := (current_fwd * 0.35 + desired * 0.65).normalized()
+		var blended := (current_fwd * 0.7 + desired * 0.3).normalized()
 		if blended.length_squared() > 0.0001:
 			var up := orientation.y.normalized()
 			if absf(blended.dot(up)) > 0.95:

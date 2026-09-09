@@ -69,12 +69,12 @@ void main() {
 	float yaw_l = mean_range(base, 2u * chunk, min(motor_count, 3u * chunk));
 	float pitch = mean_range(base, 3u * chunk, min(motor_count, 4u * chunk));
 	float yaw_r = mean_range(base, 4u * chunk, motor_count);
-	float yaw = yaw_l - yaw_r;
+	float yaw = (yaw_l - yaw_r) * 2.2;
 	float roll = (yaw_l + yaw_r) * 0.2;
 
-	outv[a * channel_count + 0u] = tanh_approx(fwd);
+	outv[a * channel_count + 0u] = tanh_approx(fwd * 1.5);
 	if (channel_count > 1u) {
-		outv[a * channel_count + 1u] = tanh_approx(vert);
+		outv[a * channel_count + 1u] = tanh_approx(vert * 1.25);
 	}
 	if (channel_count > 2u) {
 		outv[a * channel_count + 2u] = tanh_approx(yaw);

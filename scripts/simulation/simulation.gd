@@ -13,7 +13,18 @@ var step_count: int = 0
 var selected_id: int = 0
 var _next_id: int = 0
 var _gpu_brain_accum: float = 0.0
-var gpu_brain_dt: float = 1.0 / 12.0 ## 12 Hz neural — leaves headroom for render ≥30 FPS
+var gpu_brain_dt: float = 1.0 / 12.0 ## 12 Hz neural at 1× wall-clock
+## User time acceleration — brain interval scales so GPU cost stays ~constant in wall time.
+var speed_scale: float = 1.0
+var _brains_this_frame: int = 0
+const MAX_BRAINS_PER_FRAME := 1
+## Multithread scratch (group tasks).
+var _mt_delta: float = 0.0
+var _mt_do_brain: bool = false
+var _mt_mate_lists: Array = []
+var _mt_packets: Array = []
+var _mt_need_mates: bool = false
+var _use_threads: bool = true
 
 
 func initialize(cfg: SimulationConfig) -> void:
@@ -70,35 +81,42 @@ func _spawn_agent(
 	return agent
 
 
+func begin_frame() -> void:
+	_brains_this_frame = 0
+
+
 func step(delta: float) -> void:
 	food.step(delta, config, rng)
-
-	var mate_lists: Array = []
-	mate_lists.resize(agents.size())
-	for i in agents.size():
-		var list: Array[Vector3] = []
-		var a: TriopsAgent = agents[i]
-		if not a.alive:
-			mate_lists[i] = list
-			continue
-		for j in agents.size():
-			if i == j:
-				continue
-			var b: TriopsAgent = agents[j]
-			if not b.alive or b.sex == a.sex:
-				continue
-			list.append(b.body.position)
-		mate_lists[i] = list
+	food.prepare_queries()
 
 	var gpu := GpuLifEngine.get_engine()
 	var use_gpu_batch := config.brain_type == "drosophila" and gpu.ready and gpu.agent_count > 0
+	var n := agents.size()
+	var threaded := _use_threads and n >= 4
+
+	# Mate lists only when a full vision/brain tick may need them (or CPU path).
+	_mt_need_mates = not use_gpu_batch
+	if use_gpu_batch:
+		var interval_guess := gpu_brain_dt * maxf(1.0, speed_scale)
+		_mt_need_mates = (_gpu_brain_accum + delta) >= interval_guess * 0.45
+
+	_mt_mate_lists = []
+	_mt_mate_lists.resize(n)
+	if threaded and _mt_need_mates:
+		var gid := WorkerThreadPool.add_group_task(_mt_build_mates, n, -1, true, "mates")
+		WorkerThreadPool.wait_for_group_task_completion(gid)
+	else:
+		for i in n:
+			_mt_build_mates(i)
 
 	if use_gpu_batch:
-		_step_agents_gpu(delta, mate_lists, gpu)
+		_step_agents_gpu(delta, _mt_mate_lists, gpu, threaded)
+	elif threaded:
+		_step_agents_cpu_mt(delta, _mt_mate_lists)
 	else:
-		for i in agents.size():
+		for i in n:
 			var agent: TriopsAgent = agents[i]
-			agent.step(config, delta, food, mate_lists[i])
+			agent.step(config, delta, food, _mt_mate_lists[i])
 			if agent.last_ate:
 				stats.meals += 1
 			if not agent.alive:
@@ -113,98 +131,32 @@ func step(delta: float) -> void:
 	step_count += 1
 
 
-func _step_agents_gpu(delta: float, mate_lists: Array, gpu: GpuLifEngine) -> void:
-	# Walls every physics frame (cheap); full vision + GPU brain on interval.
-	_gpu_brain_accum += delta
-	var wall_alert := false
-	for i in agents.size():
+func _mt_build_mates(i: int) -> void:
+	var list: Array[Vector3] = []
+	if _mt_need_mates:
+		var a: TriopsAgent = agents[i]
+		if a.alive:
+			for j in agents.size():
+				if i == j:
+					continue
+				var b: TriopsAgent = agents[j]
+				if not b.alive or b.sex == a.sex:
+					continue
+				list.append(b.body.position)
+	_mt_mate_lists[i] = list
+
+
+func _step_agents_cpu_mt(delta: float, mate_lists: Array) -> void:
+	_mt_delta = delta
+	_mt_mate_lists = mate_lists
+	var n := agents.size()
+	var gid := WorkerThreadPool.add_group_task(_mt_cpu_agent_body, n, -1, true, "cpu_agents")
+	WorkerThreadPool.wait_for_group_task_completion(gid)
+	# Eating must stay serial (mutates food).
+	for i in n:
 		var agent: TriopsAgent = agents[i]
 		if not agent.alive:
 			continue
-		if agent.sensors.wall_urgency_fast(
-			agent.body.position,
-			agent.body.orientation,
-			config.aquarium_half_extents,
-			config.eye_ray_length,
-			agent.body.velocity
-		) > 0.5:
-			wall_alert = true
-			break
-
-	var interval := gpu_brain_dt * 0.45 if wall_alert else gpu_brain_dt
-	var do_brain := _gpu_brain_accum >= interval
-	if do_brain:
-		_gpu_brain_accum = 0.0
-
-	var packets: Array = []
-	packets.resize(agents.size())
-
-	for i in agents.size():
-		var agent: TriopsAgent = agents[i]
-		if not agent.alive:
-			packets[i] = null
-			continue
-		agent.age += delta
-		agent.mating_cooldown = maxf(0.0, agent.mating_cooldown - delta)
-		agent._update_scale(config)
-		var sensory: SensoryPacket
-		if do_brain:
-			sensory = agent.sensors.sense(
-				agent.body.position,
-				agent.body.orientation,
-				config.aquarium_half_extents,
-				config.eye_ray_length,
-				food,
-				mate_lists[i],
-				config.mate_sense_radius,
-				agent.body.velocity,
-				config.food_sense_radius
-			)
-			sensory.apply_energy_motivation(agent.energy)
-			agent.sensors.last_packet = sensory
-		else:
-			# Reuse last full vision; only nudge loom scalars for assists (no mosaic).
-			sensory = agent.sensors.last_packet
-			if sensory == null:
-				sensory = SensoryPacket.new()
-			_nudge_wall_scalars(agent, sensory)
-		packets[i] = sensory
-
-	if do_brain:
-		for i in agents.size():
-			var agent: TriopsAgent = agents[i]
-			if not agent.alive or packets[i] == null:
-				continue
-			var db := agent.brain as DrosophilaBrain
-			if db:
-				db.prepare_gpu_drive(packets[i])
-		gpu.step(interval)
-		for i in agents.size():
-			var agent: TriopsAgent = agents[i]
-			if not agent.alive:
-				continue
-			var db := agent.brain as DrosophilaBrain
-			if db:
-				db.fetch_gpu_outputs()
-	else:
-		for i in agents.size():
-			var agent: TriopsAgent = agents[i]
-			if not agent.alive or packets[i] == null:
-				continue
-			var db := agent.brain as DrosophilaBrain
-			if db:
-				db.refresh_interface(packets[i])
-
-	for i in agents.size():
-		var agent: TriopsAgent = agents[i]
-		if not agent.alive:
-			continue
-		var db := agent.brain as DrosophilaBrain
-		var outputs := db.get_outputs() if db else agent.brain.get_outputs()
-		var cmd := agent.motor.decode(outputs)
-		agent.body.apply_motor(cmd, config, delta)
-		var move_cost: float = agent.body.velocity.length() * config.swim_energy_cost * delta
-		agent.energy -= config.energy_drain_per_second * delta + move_cost
 		var gained := food.try_eat(agent.body.position, config.eat_radius * agent.scale, config)
 		agent.last_ate = gained > 0.0
 		if agent.last_ate:
@@ -219,6 +171,188 @@ func _step_agents_gpu(delta: float, mate_lists: Array, gpu: GpuLifEngine) -> voi
 		if agent.health <= 0.0 or agent.age_days(config) >= config.max_lifespan_days:
 			agent.alive = false
 			stats.record_death(agent.age_days(config))
+
+
+func _mt_cpu_agent_body(i: int) -> void:
+	## Sense + brain + motor on worker; eat deferred to main.
+	var agent: TriopsAgent = agents[i]
+	if agent == null or not agent.alive or agent.brain == null:
+		return
+	var delta := _mt_delta
+	agent.age += delta
+	agent.mating_cooldown = maxf(0.0, agent.mating_cooldown - delta)
+	agent._update_scale(config)
+	var sensory := agent.sensors.sense(
+		agent.body.position,
+		agent.body.orientation,
+		config.aquarium_half_extents,
+		config.eye_ray_length,
+		food,
+		_mt_mate_lists[i],
+		config.mate_sense_radius,
+		agent.body.velocity,
+		config.food_sense_radius
+	)
+	sensory.apply_energy_motivation(agent.energy)
+	agent.sensors.last_packet = sensory
+	var outputs := agent.brain.step(sensory, delta)
+	var cmd := agent.motor.decode(outputs)
+	agent.body.apply_motor(cmd, config, delta)
+	var move_cost: float = agent.body.velocity.length() * config.swim_energy_cost * delta
+	agent.energy -= config.energy_drain_per_second * delta + move_cost
+
+
+func _step_agents_gpu(delta: float, mate_lists: Array, gpu: GpuLifEngine, threaded: bool = false) -> void:
+	# Walls every physics frame (cheap); full vision + GPU brain on interval.
+	# speed_scale stretches the neural interval so 8×/16× doesn't multiply Vulkan syncs.
+	_gpu_brain_accum += delta
+	var wall_alert := false
+	var food_alert := false
+	for i in agents.size():
+		var agent: TriopsAgent = agents[i]
+		if not agent.alive:
+			continue
+		if agent.sensors.wall_urgency_fast(
+			agent.body.position,
+			agent.body.orientation,
+			config.aquarium_half_extents,
+			config.eye_ray_length,
+			agent.body.velocity
+		) > 0.5:
+			wall_alert = true
+		var lp: SensoryPacket = agent.sensors.last_packet
+		if lp != null and lp.food_bearing_strength > 0.35:
+			food_alert = true
+		if wall_alert and food_alert:
+			break
+
+	var interval := gpu_brain_dt * maxf(1.0, speed_scale)
+	if wall_alert:
+		interval *= 0.55
+	elif food_alert:
+		interval *= 0.7  # Think faster when food is in view — fly-like.
+	var do_brain := _gpu_brain_accum >= interval and _brains_this_frame < MAX_BRAINS_PER_FRAME
+	if do_brain:
+		_gpu_brain_accum = 0.0
+		_brains_this_frame += 1
+
+	_mt_delta = delta
+	_mt_do_brain = do_brain
+	_mt_mate_lists = mate_lists
+	_mt_packets = []
+	_mt_packets.resize(agents.size())
+
+	if threaded:
+		var gid := WorkerThreadPool.add_group_task(_mt_gpu_sense, agents.size(), -1, true, "sense")
+		WorkerThreadPool.wait_for_group_task_completion(gid)
+	else:
+		for i in agents.size():
+			_mt_gpu_sense(i)
+
+	if do_brain:
+		for i in agents.size():
+			var agent: TriopsAgent = agents[i]
+			if not agent.alive or _mt_packets[i] == null:
+				continue
+			var db := agent.brain as DrosophilaBrain
+			if db:
+				db.prepare_gpu_drive(_mt_packets[i])
+		gpu.step(interval)
+		for i in agents.size():
+			var agent: TriopsAgent = agents[i]
+			if not agent.alive:
+				continue
+			var db := agent.brain as DrosophilaBrain
+			if db:
+				db.fetch_gpu_outputs()
+	else:
+		if threaded:
+			var gid2 := WorkerThreadPool.add_group_task(_mt_refresh_iface, agents.size(), -1, true, "iface")
+			WorkerThreadPool.wait_for_group_task_completion(gid2)
+		else:
+			for i in agents.size():
+				_mt_refresh_iface(i)
+
+	if threaded:
+		var gid3 := WorkerThreadPool.add_group_task(_mt_gpu_body, agents.size(), -1, true, "body")
+		WorkerThreadPool.wait_for_group_task_completion(gid3)
+	else:
+		for i in agents.size():
+			_mt_gpu_body(i)
+
+	# Serial food mutation + death bookkeeping.
+	for i in agents.size():
+		var agent: TriopsAgent = agents[i]
+		if not agent.alive:
+			continue
+		var gained := food.try_eat(agent.body.position, config.eat_radius * agent.scale, config)
+		agent.last_ate = gained > 0.0
+		if agent.last_ate:
+			agent.energy = minf(1.5, agent.energy + gained)
+			stats.meals += 1
+		if agent.energy < 0.15:
+			agent.health -= config.starvation_health_drain * delta
+		elif agent.energy > 0.5:
+			agent.health = minf(1.0, agent.health + 0.02 * delta)
+		agent.energy = clampf(agent.energy, 0.0, 1.5)
+		agent.health = clampf(agent.health, 0.0, 1.0)
+		if agent.health <= 0.0 or agent.age_days(config) >= config.max_lifespan_days:
+			agent.alive = false
+			stats.record_death(agent.age_days(config))
+
+
+func _mt_gpu_sense(i: int) -> void:
+	var agent: TriopsAgent = agents[i]
+	if not agent.alive:
+		_mt_packets[i] = null
+		return
+	var delta := _mt_delta
+	agent.age += delta
+	agent.mating_cooldown = maxf(0.0, agent.mating_cooldown - delta)
+	agent._update_scale(config)
+	var sensory: SensoryPacket
+	if _mt_do_brain:
+		sensory = agent.sensors.sense(
+			agent.body.position,
+			agent.body.orientation,
+			config.aquarium_half_extents,
+			config.eye_ray_length,
+			food,
+			_mt_mate_lists[i],
+			config.mate_sense_radius,
+			agent.body.velocity,
+			config.food_sense_radius
+		)
+		sensory.apply_energy_motivation(agent.energy)
+		agent.sensors.last_packet = sensory
+	else:
+		sensory = agent.sensors.last_packet
+		if sensory == null:
+			sensory = SensoryPacket.new()
+		_nudge_wall_scalars(agent, sensory)
+	_mt_packets[i] = sensory
+
+
+func _mt_refresh_iface(i: int) -> void:
+	var agent: TriopsAgent = agents[i]
+	if not agent.alive or _mt_packets[i] == null:
+		return
+	var db := agent.brain as DrosophilaBrain
+	if db:
+		db.refresh_interface(_mt_packets[i])
+
+
+func _mt_gpu_body(i: int) -> void:
+	var agent: TriopsAgent = agents[i]
+	if agent == null or not agent.alive or agent.brain == null:
+		return
+	var delta := _mt_delta
+	var db := agent.brain as DrosophilaBrain
+	var outputs := db.get_outputs() if db else agent.brain.get_outputs()
+	var cmd := agent.motor.decode(outputs)
+	agent.body.apply_motor(cmd, config, delta)
+	var move_cost: float = agent.body.velocity.length() * config.swim_energy_cost * delta
+	agent.energy -= config.energy_drain_per_second * delta + move_cost
 
 
 func _nudge_wall_scalars(agent: TriopsAgent, sensory: SensoryPacket) -> void:
@@ -245,6 +379,20 @@ func _nudge_wall_scalars(agent: TriopsAgent, sensory: SensoryPacket) -> void:
 	sensory.ceiling_loom = agent.sensors.axis_loom(
 		agent.body.position, Vector3.UP, config.aquarium_half_extents, config.eye_ray_length, agent.body.velocity
 	)
+	# Refresh nearest-food bearing cheaply so yaw stays purposeful between brain ticks.
+	if food != null:
+		var near := food.nearby_indices(agent.body.position, config.food_sense_radius)
+		var bear: Vector2 = agent.sensors._nearest_bearing(
+			agent.body.position, agent.body.orientation, food, near, config.food_sense_radius
+		)
+		sensory.food_bearing_yaw = bear.x
+		sensory.food_bearing_strength = bear.y
+		if sensory.food_bearing_strength > 0.08 and absf(sensory.food_bearing_yaw) > 0.04:
+			var nudge := sensory.food_bearing_yaw * sensory.food_bearing_strength * 0.45
+			if sensory.left_eye.size() > 1:
+				sensory.left_eye[1] = minf(maxf(sensory.left_eye[1] * 0.92, 0.0) + maxf(nudge, 0.0), 3.5)
+			if sensory.right_eye.size() > 1:
+				sensory.right_eye[1] = minf(maxf(sensory.right_eye[1] * 0.92, 0.0) + maxf(-nudge, 0.0), 3.5)
 
 
 func _process_mating() -> void:

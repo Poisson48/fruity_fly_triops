@@ -14,6 +14,7 @@ var time_scale: float = 1.0
 var _speed_index: int = 2
 var _extinct_notified: bool = false
 var _fps_ema: float = 60.0
+var _visual_skip: int = 0
 
 @onready var aquarium: AquariumVisual = $Aquarium
 @onready var triops_visual: TriopsVisual = $TriopsVisual
@@ -52,34 +53,37 @@ func _process(delta: float) -> void:
 	if fps > 1.0:
 		_fps_ema = lerpf(_fps_ema, float(fps), 0.1)
 
-	# Adaptive sim catch-up: never tank the frame for neural work.
-	var max_steps := 2
-	if _fps_ema >= 50.0:
-		max_steps = mini(8, maxi(2, int(ceil(3.0 * time_scale))))
-	elif _fps_ema >= TARGET_FPS:
-		max_steps = mini(4, maxi(1, int(ceil(2.0 * time_scale))))
-	else:
-		max_steps = 1
-		# If user sped up too much, auto-ease time_scale toward 1x.
-		if time_scale > 1.0 and _fps_ema < 25.0:
-			time_scale = maxf(1.0, time_scale * 0.95)
-			_speed_index = 2
-			for i in SPEED_STEPS.size():
-				if absf(SPEED_STEPS[i] - time_scale) < 0.01:
-					_speed_index = i
-					break
+	world.speed_scale = time_scale
+	world.begin_frame()
 
 	if not paused and time_scale > 0.0:
-		_accum += delta * time_scale
-		var dt: float = config.simulation_dt
-		var steps := 0
-		while _accum >= dt and steps < max_steps:
-			world.step(dt)
-			_accum -= dt
-			steps += 1
-		# Drop backlog instead of spiral-of-death.
-		if _accum > dt * 4.0:
-			_accum = 0.0
+		if time_scale <= 1.0:
+			# Accurate fixed-step at ≤1×.
+			_accum += delta * time_scale
+			var dt: float = config.simulation_dt
+			var max_steps := 8 if _fps_ema >= 50.0 else (4 if _fps_ema >= TARGET_FPS else 2)
+			var steps := 0
+			while _accum >= dt and steps < max_steps:
+				world.step(dt)
+				_accum -= dt
+				steps += 1
+			if _accum > dt * 8.0:
+				_accum = dt * 4.0
+		else:
+			# Fast-forward: large physics slices, ≤1 GPU brain/frame (via speed_scale).
+			_accum += delta * time_scale
+			var max_slices := mini(10, maxi(2, int(ceil(time_scale))))
+			var slice := minf(_accum / float(max_slices), 0.10)
+			slice = maxf(slice, config.simulation_dt)
+			var steps := 0
+			while _accum >= config.simulation_dt and steps < max_slices:
+				var dt := minf(slice, minf(_accum, 0.10))
+				world.step(dt)
+				_accum -= dt
+				steps += 1
+			# Soft cap leftover so we keep accelerating instead of stalling forever.
+			if _accum > time_scale * 0.5:
+				_accum = time_scale * 0.25
 	else:
 		_accum = 0.0
 
@@ -87,17 +91,29 @@ func _process(delta: float) -> void:
 		_extinct_notified = true
 		paused = true
 
-	_sync_visuals()
+	# At high speed, sync visuals less often.
+	var vis_every := 1
+	if time_scale >= 8.0:
+		vis_every = 4
+	elif time_scale >= 4.0:
+		vis_every = 3
+	elif time_scale >= 2.0:
+		vis_every = 2
+	_visual_skip = (_visual_skip + 1) % vis_every
+	if _visual_skip == 0:
+		_sync_visuals()
 	var cam_mode := camera.mode_name()
 	var backend := "cpu"
 	var eng := GpuLifEngine.get_engine()
 	if eng.ready:
 		backend = eng.backend_name
+		if world._use_threads:
+			backend += "+mt"
 	if debug_ui.visible:
 		debug_ui.update_display(world, _fps_ema, time_scale, paused, "%s | %s" % [cam_mode, backend])
 	var bp := debug_ui.get_node_or_null("BrainPanel") as CanvasItem
 	if bp:
-		bp.visible = debug_ui.visible
+		bp.visible = debug_ui.visible and time_scale <= 2.0
 
 
 func _sync_visuals() -> void:
@@ -155,6 +171,7 @@ func _toggle_pause() -> void:
 func _slower() -> void:
 	_speed_index = maxi(0, _speed_index - 1)
 	time_scale = SPEED_STEPS[_speed_index]
+	world.speed_scale = time_scale
 	if paused:
 		paused = false
 
@@ -162,6 +179,7 @@ func _slower() -> void:
 func _faster() -> void:
 	_speed_index = mini(SPEED_STEPS.size() - 1, _speed_index + 1)
 	time_scale = SPEED_STEPS[_speed_index]
+	world.speed_scale = time_scale
 	if paused:
 		paused = false
 

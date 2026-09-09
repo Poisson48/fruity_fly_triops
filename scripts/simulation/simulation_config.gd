@@ -19,8 +19,8 @@ extends Resource
 @export var max_speed: float = 4.0
 @export var linear_accel: float = 8.0
 @export var linear_drag: float = 1.5
-@export var angular_accel: float = 2.5
-@export var angular_drag: float = 2.0
+@export var angular_accel: float = 3.4
+@export var angular_drag: float = 1.7
 @export var wall_bounce: float = 0.4
 @export var wall_margin: float = 0.3
 

@@ -71,28 +71,28 @@ func _ensure_interface_genes(rng: RandomNumberGenerator) -> void:
 		genome.randomize_genes(rng, 0.12)
 		return
 	if genome.sense_gains.size() < 6:
-		genome.sense_gains = PackedFloat32Array([1.45, 2.35, 0.65, 0.04, 0.5, 1.2, 1.15, 1.55])
+		genome.sense_gains = PackedFloat32Array([2.45, 2.2, 0.65, 0.04, 0.55, 1.2, 1.25, 1.45])
 	elif genome.sense_gains.size() < 8:
 		var sg := genome.sense_gains.duplicate()
 		while sg.size() < 8:
 			sg.append(1.15 if sg.size() == 6 else 1.55)
 		genome.sense_gains = sg
-	if genome.interface_mix <= 0.0 or genome.interface_mix > 0.2:
-		genome.interface_mix = 0.06
-	if genome.forward_tonic < 0.02:
-		genome.forward_tonic = 0.05
-	if genome.chemotaxis <= 0.0:
-		genome.chemotaxis = 0.35
-	if genome.mate_taxis <= 0.0:
-		genome.mate_taxis = 0.45
-	if genome.wall_taxis <= 0.0:
-		genome.wall_taxis = 0.55
-	if genome.wall_brake <= 0.0:
-		genome.wall_brake = 0.5
-	if genome.vertical_amp <= 0.0:
-		genome.vertical_amp = 0.55
-	if genome.pitch_amp <= 0.0:
-		genome.pitch_amp = 0.45
+	if genome.interface_mix < 0.0 or genome.interface_mix > 0.05:
+		genome.interface_mix = 0.0
+	# Legacy taxis genes stay at 0 — motor is SEZ-only.
+	genome.forward_tonic = 0.0
+	genome.chemotaxis = 0.0
+	genome.mate_taxis = 0.0
+	genome.wall_taxis = 0.0
+	genome.wall_brake = 0.0
+	genome.vertical_amp = 0.0
+	genome.pitch_amp = 0.0
+	if genome.sense_gains.size() >= 1 and genome.sense_gains[0] < 1.8:
+		genome.sense_gains[0] = 2.45
+	if genome.motor_gains.size() > MotorInterface.CHANNEL_YAW:
+		genome.motor_gains[MotorInterface.CHANNEL_YAW] = maxf(
+			genome.motor_gains[MotorInterface.CHANNEL_YAW], 1.55
+		)
 
 
 func prepare_gpu_drive(packet: SensoryPacket) -> void:
@@ -103,7 +103,7 @@ func prepare_gpu_drive(packet: SensoryPacket) -> void:
 
 
 func refresh_interface(packet: SensoryPacket) -> void:
-	## Re-apply taxis/adapter every physics frame using last neural motor readout.
+	## Re-scale SEZ motor with gains each physics frame (no assist steer).
 	_pending_packet = packet
 	if not _ready:
 		return
@@ -141,98 +141,39 @@ func step(inputs: SensoryPacket, delta: float) -> PackedFloat32Array:
 		steps += 1
 
 	var raw := network.read_motor_channels(MotorInterface.CHANNEL_COUNT)
+	_last_raw = raw
 	_outputs = _blend_interface(inputs, raw)
 	return _outputs
 
 
 func _blend_interface(packet: SensoryPacket, raw: PackedFloat32Array) -> PackedFloat32Array:
+	## Pure FlyWire motor: SEZ readout × gains. No post-hoc taxis / chase / wall steer.
 	var out := PackedFloat32Array()
 	out.resize(MotorInterface.CHANNEL_COUNT)
+	var mix := 0.0
+	if genome:
+		mix = clampf(genome.interface_mix, 0.0, 0.05)
 	var flat := packet.as_flat()
-	# Prefer FlyWire motor readout; tiny adapter only.
-	var mix := genome.interface_mix if genome else 0.06
-	mix = clampf(mix, 0.0, 0.2)
 	var in_n := genome.input_count if genome else 9
 	for o in MotorInterface.CHANNEL_COUNT:
-		var adapter: float = genome.bias[o] if genome and o < genome.bias.size() else 0.0
-		if genome and genome.weights.size() >= in_n * MotorInterface.CHANNEL_COUNT:
-			var row := o * in_n
-			for i in mini(in_n, flat.size()):
-				adapter += genome.weights[row + i] * flat[i]
 		var brain_v := raw[o] if o < raw.size() else 0.0
-		var blended := brain_v * (1.0 - mix) + tanh(adapter) * mix
+		var v := brain_v
+		if mix > 0.0 and genome:
+			var adapter: float = genome.bias[o] if o < genome.bias.size() else 0.0
+			if genome.weights.size() >= in_n * MotorInterface.CHANNEL_COUNT:
+				var row := o * in_n
+				for i in mini(in_n, flat.size()):
+					adapter += genome.weights[row + i] * flat[i]
+			v = brain_v * (1.0 - mix) + tanh(adapter) * mix
 		var gain: float = genome.motor_gains[o] if genome and o < genome.motor_gains.size() else 1.0
-		out[o] = clampf(blended * gain, -1.0, 1.0)
-
-	# Soft residual assists — only fill in when the connectome is quiet.
-	const ASSIST := 0.06
-	var brain_energy := (
-		absf(raw[0] if raw.size() > 0 else 0.0)
-		+ absf(raw[1] if raw.size() > 1 else 0.0)
-		+ absf(raw[2] if raw.size() > 2 else 0.0)
-		+ absf(raw[3] if raw.size() > 3 else 0.0)
-	)
-	var brain_gate := clampf(1.0 - brain_energy * 2.2, 0.15, 1.0)
-	var assist := ASSIST * brain_gate
-	var wall_l := flat[0] if flat.size() > 0 else 0.0
-	var food_l := flat[1] if flat.size() > 1 else 0.0
-	var mate_l := flat[2] if flat.size() > 2 else 0.0
-	var wall_r := flat[3] if flat.size() > 3 else 0.0
-	var food_r := flat[4] if flat.size() > 4 else 0.0
-	var mate_r := flat[5] if flat.size() > 5 else 0.0
-	var wall_m := flat[6] if flat.size() > 6 else 0.0
-	var food_m := flat[7] if flat.size() > 7 else 0.0
-	var mate_m := flat[8] if flat.size() > 8 else 0.0
-	var chemo: float = (genome.chemotaxis if genome else 0.35) * assist
-	var mtax: float = (genome.mate_taxis if genome else 0.45) * assist
-	var wtax: float = (genome.wall_taxis if genome else 0.55) * assist
-	var wbrake: float = (genome.wall_brake if genome else 0.5) * assist
-	var food_sum := food_l + food_r + food_m
-	var mate_sum := mate_l + mate_r + mate_m
-	var wall_max := maxf(wall_m, maxf(wall_l, wall_r))
-	var expand_max := maxf(packet.expand_m, maxf(packet.expand_l, packet.expand_r))
-	out[MotorInterface.CHANNEL_YAW] = clampf(
-		out[MotorInterface.CHANNEL_YAW]
-		+ (food_l - food_r) * chemo
-		+ (mate_l - mate_r) * mtax
-		+ (wall_r - wall_l) * wtax
-		+ packet.flow_yaw * assist * 0.4
-		+ (packet.expand_r - packet.expand_l) * wtax * 0.3,
-		-1.0,
-		1.0
-	)
-	var brake := (wall_m * 1.0 + maxf(wall_l, wall_r) * 0.4 + expand_max * 0.55) * wbrake
-	out[MotorInterface.CHANNEL_FORWARD] = clampf(
-		out[MotorInterface.CHANNEL_FORWARD] + food_sum * 0.02 * assist + mate_sum * 0.015 * assist - brake,
-		-1.0,
-		1.0
-	)
-	var tonic: float = (genome.forward_tonic if genome else 0.05) * (1.0 - maxf(wall_max, expand_max) * 0.8)
-	out[MotorInterface.CHANNEL_FORWARD] = clampf(out[MotorInterface.CHANNEL_FORWARD] + tonic, -1.0, 1.0)
-
-	var vamp: float = (genome.vertical_amp if genome else 0.55) * assist
-	var pamp: float = (genome.pitch_amp if genome else 0.45) * assist
-	var food_v := packet.food_up - packet.food_down
-	var mate_v := packet.mate_up - packet.mate_down
-	out[MotorInterface.CHANNEL_VERTICAL] = clampf(
-		out[MotorInterface.CHANNEL_VERTICAL]
-		+ food_v * vamp
-		+ mate_v * vamp * 0.5
-		+ (packet.ceiling_loom - packet.floor_loom) * assist * 0.55
-		+ packet.flow_pitch * assist * 0.35,
-		-1.0,
-		1.0
-	)
-	out[MotorInterface.CHANNEL_PITCH] = clampf(
-		out[MotorInterface.CHANNEL_PITCH]
-		+ food_v * pamp
-		+ mate_v * pamp * 0.4
-		+ (packet.ceiling_loom - packet.floor_loom) * assist * 0.35
-		+ packet.flow_pitch * assist * 0.3,
-		-1.0,
-		1.0
-	)
+		out[o] = clampf(v * gain, -1.0, 1.0)
+	# Mild roll damping only (body stability), not steering.
+	out[MotorInterface.CHANNEL_ROLL] = clampf(out[MotorInterface.CHANNEL_ROLL] * 0.45, -0.55, 0.55)
 	return out
+
+
+func get_raw_motor() -> PackedFloat32Array:
+	return _last_raw
 
 
 func get_activity_snapshot() -> Dictionary:
@@ -345,5 +286,5 @@ func get_debug_info() -> Dictionary:
 		"backend": "gpu" if use_gpu else "cpu",
 		"generation": genome.generation if genome else 0,
 		"interface_mix": genome.interface_mix if genome else 0.0,
-		"note": "FlyWire-led LIF+ (adapter %.0f%%, assist gated)" % (clampf(genome.interface_mix if genome else 0.06, 0, 1) * 100.0),
+		"note": "FlyWire-only motor (SEZ readout; no assist steer)",
 	}
