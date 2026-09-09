@@ -56,6 +56,10 @@ func initialize(config: SimulationConfig, rng: RandomNumberGenerator, genome_in:
 		use_gpu = gpu_slot >= 0
 	if not use_gpu:
 		network = template.instantiate()
+		# CPU path: coarser neural dt so headless stays interactive.
+		brain_dt = 1.0 / 10.0
+		network.max_active = 400
+		network.max_spike_events = 80
 		if genome and genome.motor_gains.size() > 0:
 			network.drive_gain = 3.2 + genome.motor_gains[0] * 0.4
 	_ready = true

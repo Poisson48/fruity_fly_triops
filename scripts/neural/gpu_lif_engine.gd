@@ -10,6 +10,7 @@ const CHANNELS := 5
 const DIRTY_WIPE_THRESHOLD := 8192
 
 static var instance: GpuLifEngine
+static var _warned_no_rd: bool = false
 
 var rd: RenderingDevice
 var _owns_rd: bool = false
@@ -107,7 +108,9 @@ func setup(template: NeuralNetwork, p_max_agents: int) -> bool:
 		rd = RenderingServer.get_rendering_device()
 		_owns_rd = false
 	if rd == null:
-		push_warning("GpuLifEngine: RenderingDevice unavailable (GPU needs a display window)")
+		if not _warned_no_rd:
+			_warned_no_rd = true
+			push_warning("GpuLifEngine: RenderingDevice unavailable — CPU LIF fallback (use tools/run_tests.sh / Xvfb for GPU)")
 		backend_name = "cpu_fallback"
 		setup_failed = true
 		return false
