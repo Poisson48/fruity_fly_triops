@@ -13,7 +13,7 @@ var step_count: int = 0
 var selected_id: int = 0
 var _next_id: int = 0
 var _gpu_brain_accum: float = 0.0
-var gpu_brain_dt: float = 1.0 / 15.0
+var gpu_brain_dt: float = 1.0 / 12.0 ## 12 Hz neural — leaves headroom for render ≥30 FPS
 
 
 func initialize(cfg: SimulationConfig) -> void:
@@ -114,9 +114,28 @@ func step(delta: float) -> void:
 
 
 func _step_agents_gpu(delta: float, mate_lists: Array, gpu: GpuLifEngine) -> void:
-	# Sense always; neural GPU steps faster near walls (loom urgency).
+	# Walls every physics frame (cheap); full vision + GPU brain on interval.
 	_gpu_brain_accum += delta
 	var wall_alert := false
+	for i in agents.size():
+		var agent: TriopsAgent = agents[i]
+		if not agent.alive:
+			continue
+		if agent.sensors.wall_urgency_fast(
+			agent.body.position,
+			agent.body.orientation,
+			config.aquarium_half_extents,
+			config.eye_ray_length,
+			agent.body.velocity
+		) > 0.5:
+			wall_alert = true
+			break
+
+	var interval := gpu_brain_dt * 0.45 if wall_alert else gpu_brain_dt
+	var do_brain := _gpu_brain_accum >= interval
+	if do_brain:
+		_gpu_brain_accum = 0.0
+
 	var packets: Array = []
 	packets.resize(agents.size())
 
@@ -128,27 +147,30 @@ func _step_agents_gpu(delta: float, mate_lists: Array, gpu: GpuLifEngine) -> voi
 		agent.age += delta
 		agent.mating_cooldown = maxf(0.0, agent.mating_cooldown - delta)
 		agent._update_scale(config)
-		var sensory := agent.sensors.sense(
-			agent.body.position,
-			agent.body.orientation,
-			config.aquarium_half_extents,
-			config.eye_ray_length,
-			food,
-			mate_lists[i],
-			config.mate_sense_radius,
-			agent.body.velocity,
-			config.food_sense_radius
-		)
-		sensory.apply_energy_motivation(agent.energy)
-		agent.sensors.last_packet = sensory
+		var sensory: SensoryPacket
+		if do_brain:
+			sensory = agent.sensors.sense(
+				agent.body.position,
+				agent.body.orientation,
+				config.aquarium_half_extents,
+				config.eye_ray_length,
+				food,
+				mate_lists[i],
+				config.mate_sense_radius,
+				agent.body.velocity,
+				config.food_sense_radius
+			)
+			sensory.apply_energy_motivation(agent.energy)
+			agent.sensors.last_packet = sensory
+		else:
+			# Reuse last full vision; only nudge loom scalars for assists (no mosaic).
+			sensory = agent.sensors.last_packet
+			if sensory == null:
+				sensory = SensoryPacket.new()
+			_nudge_wall_scalars(agent, sensory)
 		packets[i] = sensory
-		if SensoryMapping.wall_urgency(sensory) > 0.5:
-			wall_alert = true
 
-	var interval := gpu_brain_dt * 0.45 if wall_alert else gpu_brain_dt
-	var do_brain := _gpu_brain_accum >= interval
 	if do_brain:
-		_gpu_brain_accum = 0.0
 		for i in agents.size():
 			var agent: TriopsAgent = agents[i]
 			if not agent.alive or packets[i] == null:
@@ -197,6 +219,32 @@ func _step_agents_gpu(delta: float, mate_lists: Array, gpu: GpuLifEngine) -> voi
 		if agent.health <= 0.0 or agent.age_days(config) >= config.max_lifespan_days:
 			agent.alive = false
 			stats.record_death(agent.age_days(config))
+
+
+func _nudge_wall_scalars(agent: TriopsAgent, sensory: SensoryPacket) -> void:
+	## Keep assist taxis roughly current without rebuilding 80-facet mosaics.
+	var u := agent.sensors.wall_urgency_fast(
+		agent.body.position,
+		agent.body.orientation,
+		config.aquarium_half_extents,
+		config.eye_ray_length,
+		agent.body.velocity
+	)
+	sensory.expand_m = maxf(sensory.expand_m * 0.85, u)
+	sensory.expand_l = maxf(sensory.expand_l * 0.85, u * 0.7)
+	sensory.expand_r = maxf(sensory.expand_r * 0.85, u * 0.7)
+	if sensory.median_eye.size() >= 1:
+		sensory.median_eye[0] = maxf(sensory.median_eye[0] * 0.85, u)
+	if sensory.left_eye.size() >= 1:
+		sensory.left_eye[0] = maxf(sensory.left_eye[0] * 0.85, u * 0.65)
+	if sensory.right_eye.size() >= 1:
+		sensory.right_eye[0] = maxf(sensory.right_eye[0] * 0.85, u * 0.65)
+	sensory.floor_loom = agent.sensors.axis_loom(
+		agent.body.position, Vector3.DOWN, config.aquarium_half_extents, config.eye_ray_length, agent.body.velocity
+	)
+	sensory.ceiling_loom = agent.sensors.axis_loom(
+		agent.body.position, Vector3.UP, config.aquarium_half_extents, config.eye_ray_length, agent.body.velocity
+	)
 
 
 func _process_mating() -> void:

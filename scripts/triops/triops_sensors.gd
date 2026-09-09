@@ -38,15 +38,17 @@ func sense(
 	var left_dirs := _compound_gaze(orientation, true)
 	var right_dirs := _compound_gaze(orientation, false)
 	var med_dirs := _median_gaze_grid(orientation)
+	# One spatial query per agent — facets reuse the shortlist.
+	var food_near := food.nearby_indices(position, maxf(ray_length, food_radius)) if food != null else PackedInt32Array()
 
 	var L := _sample_compound(
-		position, half_extents, ray_length, food, mates, mate_radius, velocity, left_dirs, AZ, EL, _prev_left_depth
+		position, half_extents, ray_length, food, food_near, mates, mate_radius, velocity, left_dirs, AZ, EL, _prev_left_depth
 	)
 	var R := _sample_compound(
-		position, half_extents, ray_length, food, mates, mate_radius, velocity, right_dirs, AZ, EL, _prev_right_depth
+		position, half_extents, ray_length, food, food_near, mates, mate_radius, velocity, right_dirs, AZ, EL, _prev_right_depth
 	)
 	var M := _sample_compound(
-		position, half_extents, ray_length, food, mates, mate_radius, velocity, med_dirs, MED_AZ, MED_EL, _prev_median_depth
+		position, half_extents, ray_length, food, food_near, mates, mate_radius, velocity, med_dirs, MED_AZ, MED_EL, _prev_median_depth
 	)
 
 	packet.left_on = L.on
@@ -96,15 +98,20 @@ func sense(
 	packet.ceiling_loom = _wall_loom(position, Vector3.UP, half_extents, ray_length, velocity)
 	packet.depth_norm = clampf(position.y / maxf(half_extents.y, 0.01), -1.0, 1.0)
 	if food != null:
-		packet.food_up = food.ray_food_signal(position, Vector3.UP, food_radius)
-		packet.food_down = food.ray_food_signal(position, Vector3.DOWN, food_radius)
+		var food_vert := food.nearby_indices(position, food_radius) if food_near.is_empty() else food_near
+		packet.food_up = food.ray_food_signal_candidates(position, Vector3.UP, food_radius, food_vert)
+		packet.food_down = food.ray_food_signal_candidates(position, Vector3.DOWN, food_radius, food_vert)
 		packet.food_up = maxf(
 			packet.food_up,
-			food.ray_food_signal(position, (Vector3.UP + -orientation.z * 0.35).normalized(), food_radius)
+			food.ray_food_signal_candidates(
+				position, (Vector3.UP + -orientation.z * 0.35).normalized(), food_radius, food_vert
+			)
 		)
 		packet.food_down = maxf(
 			packet.food_down,
-			food.ray_food_signal(position, (Vector3.DOWN + -orientation.z * 0.35).normalized(), food_radius)
+			food.ray_food_signal_candidates(
+				position, (Vector3.DOWN + -orientation.z * 0.35).normalized(), food_radius, food_vert
+			)
 		)
 	packet.mate_up = _mate_hemisphere(position, Vector3.UP, mates, mate_radius)
 	packet.mate_down = _mate_hemisphere(position, Vector3.DOWN, mates, mate_radius)
@@ -131,11 +138,112 @@ class EyeSample:
 	var mate_sum: float = 0.0
 
 
+func sense_walls_fast(
+	position: Vector3,
+	orientation: Basis,
+	half_extents: Vector3,
+	ray_length: float,
+	velocity: Vector3 = Vector3.ZERO
+) -> SensoryPacket:
+	## Cheap refresh between brain ticks: walls / loom / flow only (no food scans).
+	var packet := last_packet if last_packet != null else SensoryPacket.new()
+	var left_dirs := _compound_gaze(orientation, true)
+	var right_dirs := _compound_gaze(orientation, false)
+	var med_dirs := _median_gaze_grid(orientation)
+	var empty_food := PackedInt32Array()
+	var empty_mates: Array[Vector3] = []
+
+	var L := _sample_compound(
+		position, half_extents, ray_length, null, empty_food, empty_mates, 0.0, velocity, left_dirs, AZ, EL, _prev_left_depth
+	)
+	var R := _sample_compound(
+		position, half_extents, ray_length, null, empty_food, empty_mates, 0.0, velocity, right_dirs, AZ, EL, _prev_right_depth
+	)
+	var M := _sample_compound(
+		position, half_extents, ray_length, null, empty_food, empty_mates, 0.0, velocity, med_dirs, MED_AZ, MED_EL, _prev_median_depth
+	)
+
+	# Keep previous ON/food & mate mosaics; refresh OFF/loom/flow/expand.
+	packet.left_off = L.off
+	packet.right_off = R.off
+	packet.median_off = M.off
+	packet.left_flow_h = L.flow_h
+	packet.left_flow_v = L.flow_v
+	packet.right_flow_h = R.flow_h
+	packet.right_flow_v = R.flow_v
+	packet.median_flow_h = M.flow_h
+	packet.median_flow_v = M.flow_v
+	packet.expand_l = L.expand
+	packet.expand_r = R.expand
+	packet.expand_m = M.expand
+	packet.contrast_l = L.contrast
+	packet.contrast_r = R.contrast
+	packet.contrast_m = M.contrast
+	if packet.left_eye.size() >= 3:
+		packet.left_eye[0] = L.loom_sum
+	else:
+		packet.left_eye = PackedFloat32Array([L.loom_sum, 0.0, 0.0])
+	if packet.right_eye.size() >= 3:
+		packet.right_eye[0] = R.loom_sum
+	else:
+		packet.right_eye = PackedFloat32Array([R.loom_sum, 0.0, 0.0])
+	if packet.median_eye.size() >= 3:
+		packet.median_eye[0] = M.loom_sum
+	else:
+		packet.median_eye = PackedFloat32Array([M.loom_sum, 0.0, 0.0])
+
+	var hs_l := _mean_arr(L.flow_h)
+	var hs_r := _mean_arr(R.flow_h)
+	var vs_l := _mean_arr(L.flow_v)
+	var vs_r := _mean_arr(R.flow_v)
+	packet.flow_yaw = clampf((hs_r - hs_l) * 0.5 + (R.loom_sum - L.loom_sum) * 0.35, -1.5, 1.5)
+	packet.flow_pitch = clampf((vs_l + vs_r) * 0.5 + _mean_arr(M.flow_v), -1.5, 1.5)
+	packet.floor_loom = _wall_loom(position, Vector3.DOWN, half_extents, ray_length, velocity)
+	packet.ceiling_loom = _wall_loom(position, Vector3.UP, half_extents, ray_length, velocity)
+	packet.depth_norm = clampf(position.y / maxf(half_extents.y, 0.01), -1.0, 1.0)
+
+	_prev_left_depth = L.depth
+	_prev_right_depth = R.depth
+	_prev_median_depth = M.depth
+	_have_prev = true
+	last_packet = packet
+	return packet
+
+
+func axis_loom(
+	origin: Vector3,
+	axis: Vector3,
+	half_extents: Vector3,
+	ray_length: float,
+	velocity: Vector3
+) -> float:
+	return _wall_loom(origin, axis, half_extents, ray_length, velocity)
+
+
+func wall_urgency_fast(
+	position: Vector3,
+	orientation: Basis,
+	half_extents: Vector3,
+	ray_length: float,
+	velocity: Vector3
+) -> float:
+	## 5 forward rays — enough to decide brain tick boost without full mosaic.
+	var fwd := -orientation.z
+	var u := 0.0
+	u = maxf(u, _wall_loom(position, fwd, half_extents, ray_length, velocity))
+	u = maxf(u, _wall_loom(position, (fwd + orientation.x * 0.45).normalized(), half_extents, ray_length, velocity))
+	u = maxf(u, _wall_loom(position, (fwd - orientation.x * 0.45).normalized(), half_extents, ray_length, velocity))
+	u = maxf(u, _wall_loom(position, Vector3.DOWN, half_extents, ray_length, velocity))
+	u = maxf(u, _wall_loom(position, Vector3.UP, half_extents, ray_length, velocity))
+	return u
+
+
 func _sample_compound(
 	origin: Vector3,
 	half: Vector3,
 	ray_length: float,
 	food: FoodSystem,
+	food_near: PackedInt32Array,
 	mates: Array[Vector3],
 	mate_radius: float,
 	velocity: Vector3,
@@ -162,7 +270,9 @@ func _sample_compound(
 		var dir: Vector3 = dirs[i] if i < dirs.size() else Vector3.FORWARD
 		var d_norm := _wall_depth_norm(origin, dir, half, ray_length)
 		var loom := _wall_loom(origin, dir, half, ray_length, velocity)
-		var food_s := food.ray_food_signal(origin, dir, ray_length) if food != null else 0.0
+		var food_s := (
+			food.ray_food_signal_candidates(origin, dir, ray_length, food_near) if food != null else 0.0
+		)
 		var mate_s := _mate_in_dir(origin, dir, mates, mate_radius)
 		# OFF ≈ near / dark edge (walls); ON ≈ bright figure (food).
 		s.depth[i] = d_norm

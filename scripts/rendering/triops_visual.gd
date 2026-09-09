@@ -44,10 +44,13 @@ func _hide_all() -> void:
 
 func sync_from_simulation(world: SimulationWorld) -> void:
 	ensure_capacity(maxi(world.config.max_triops, world.agents.size()))
-	_hide_all()
-	for i in world.agents.size():
-		if i >= multimesh.instance_count:
-			break
+	var n_show := world.agents.size()
+	var n_slots := multimesh.instance_count
+	var hidden := Transform3D(Basis.IDENTITY, Vector3(0, -9999, 0))
+	for i in n_slots:
+		if i >= n_show:
+			multimesh.set_instance_transform(i, hidden)
+			continue
 		var agent: TriopsAgent = world.agents[i]
 		var xf := Transform3D(agent.body.orientation, agent.body.position)
 		xf = xf.scaled_local(Vector3.ONE * agent.scale)

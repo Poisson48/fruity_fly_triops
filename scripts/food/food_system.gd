@@ -1,11 +1,17 @@
 class_name FoodSystem
 extends RefCounted
 ## V1: food particles in the aquarium volume (simulation data, not Nodes).
+## Spatial hash accelerates ray / proximity / eat queries.
+
+const CELL := 4.0
 
 var positions: PackedVector3Array = PackedVector3Array()
 var amounts: PackedFloat32Array = PackedFloat32Array()
 var respawn_timers: PackedFloat32Array = PackedFloat32Array()
 var active: PackedByteArray = PackedByteArray()  # 1 = present
+
+var _grid: Dictionary = {} ## Vector3i -> PackedInt32Array
+var _grid_dirty: bool = true
 
 
 func initialize(config: SimulationConfig, rng: RandomNumberGenerator) -> void:
@@ -17,6 +23,7 @@ func initialize(config: SimulationConfig, rng: RandomNumberGenerator) -> void:
 		_spawn_at(i, config, rng)
 		active[i] = 1
 		respawn_timers[i] = 0.0
+	_rebuild_grid()
 
 
 func _spawn_at(i: int, config: SimulationConfig, rng: RandomNumberGenerator) -> void:
@@ -29,22 +36,83 @@ func _spawn_at(i: int, config: SimulationConfig, rng: RandomNumberGenerator) -> 
 	amounts[i] = config.food_energy
 	active[i] = 1
 	respawn_timers[i] = 0.0
+	_grid_dirty = true
 
 
 func step(delta: float, config: SimulationConfig, rng: RandomNumberGenerator) -> void:
+	var changed := false
 	for i in positions.size():
 		if active[i] == 1:
 			continue
 		respawn_timers[i] -= delta
 		if respawn_timers[i] <= 0.0:
 			_spawn_at(i, config, rng)
+			changed = true
+	if changed or _grid_dirty:
+		_rebuild_grid()
+
+
+func _cell_key(p: Vector3) -> Vector3i:
+	return Vector3i(
+		int(floor(p.x / CELL)),
+		int(floor(p.y / CELL)),
+		int(floor(p.z / CELL))
+	)
+
+
+func _rebuild_grid() -> void:
+	_grid.clear()
+	for i in positions.size():
+		if active[i] == 0:
+			continue
+		var key := _cell_key(positions[i])
+		if not _grid.has(key):
+			_grid[key] = PackedInt32Array()
+		var bucket: PackedInt32Array = _grid[key]
+		bucket.append(i)
+		_grid[key] = bucket
+	_grid_dirty = false
+
+
+## Indices of active food within radius (axis-aligned cell neighborhood).
+func nearby_indices(origin: Vector3, radius: float) -> PackedInt32Array:
+	if _grid_dirty:
+		_rebuild_grid()
+	var out := PackedInt32Array()
+	var r_cells := int(ceil(radius / CELL))
+	var c := _cell_key(origin)
+	var r2 := radius * radius
+	for x in range(c.x - r_cells, c.x + r_cells + 1):
+		for y in range(c.y - r_cells, c.y + r_cells + 1):
+			for z in range(c.z - r_cells, c.z + r_cells + 1):
+				var key := Vector3i(x, y, z)
+				if not _grid.has(key):
+					continue
+				var bucket: PackedInt32Array = _grid[key]
+				for j in bucket.size():
+					var i: int = bucket[j]
+					if active[i] == 0:
+						continue
+					if origin.distance_squared_to(positions[i]) <= r2:
+						out.append(i)
+	return out
 
 
 ## Food intensity along a ray (0..1), cone-ish falloff.
 func ray_food_signal(origin: Vector3, direction: Vector3, ray_length: float) -> float:
+	return ray_food_signal_candidates(origin, direction, ray_length, nearby_indices(origin, ray_length))
+
+
+func ray_food_signal_candidates(
+	origin: Vector3,
+	direction: Vector3,
+	ray_length: float,
+	candidates: PackedInt32Array
+) -> float:
 	var dir := direction.normalized()
 	var best := 0.0
-	for i in positions.size():
+	for j in candidates.size():
+		var i: int = candidates[j]
 		if active[i] == 0:
 			continue
 		var to := positions[i] - origin
@@ -62,10 +130,10 @@ func ray_food_signal(origin: Vector3, direction: Vector3, ray_length: float) -> 
 
 ## Omnidirectional nearest food strength (backup / median eye).
 func proximity_food(origin: Vector3, radius: float) -> float:
+	var candidates := nearby_indices(origin, radius)
 	var best := 0.0
-	for i in positions.size():
-		if active[i] == 0:
-			continue
+	for j in candidates.size():
+		var i: int = candidates[j]
 		var dist := origin.distance_to(positions[i])
 		if dist > radius:
 			continue
@@ -77,11 +145,11 @@ func proximity_food(origin: Vector3, radius: float) -> float:
 
 ## Eat nearest food within radius. Returns energy gained.
 func try_eat(origin: Vector3, eat_radius: float, config: SimulationConfig) -> float:
+	var candidates := nearby_indices(origin, eat_radius)
 	var best_i := -1
 	var best_d := eat_radius
-	for i in positions.size():
-		if active[i] == 0:
-			continue
+	for j in candidates.size():
+		var i: int = candidates[j]
 		var d := origin.distance_to(positions[i])
 		if d <= best_d:
 			best_d = d
@@ -92,6 +160,7 @@ func try_eat(origin: Vector3, eat_radius: float, config: SimulationConfig) -> fl
 	active[best_i] = 0
 	respawn_timers[best_i] = config.food_respawn_seconds
 	amounts[best_i] = 0.0
+	_grid_dirty = true
 	return gained
 
 

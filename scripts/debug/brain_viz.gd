@@ -47,7 +47,7 @@ func update_from_agent(agent: TriopsAgent, force: bool = false) -> void:
 	if agent == null or agent.brain == null:
 		return
 	_accum += 0.016
-	if not force and _accum < 0.08:
+	if not force and _accum < 0.12:
 		return
 	_accum = 0.0
 

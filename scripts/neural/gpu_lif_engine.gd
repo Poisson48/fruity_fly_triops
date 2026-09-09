@@ -6,6 +6,8 @@ extends RefCounted
 const FP := 1024.0
 const MAX_EDGES_PER_SPIKE := 48
 const CHANNELS := 5
+## If more than this many drive cells dirty, wipe the live bank instead.
+const DIRTY_WIPE_THRESHOLD := 8192
 
 static var instance: GpuLifEngine
 
@@ -64,11 +66,23 @@ var _set_integrate: RID
 var _set_synapse: RID
 var _set_motor: RID
 
-var _drive_cpu: PackedInt32Array = PackedInt32Array()
+## Drive stored as bytes to avoid PackedInt32Array.to_byte_array() alloc each step.
+var _drive_bytes: PackedByteArray = PackedByteArray()
+var _dirty: PackedInt32Array = PackedInt32Array()
 var _last_spikes: PackedInt32Array = PackedInt32Array()
 var _motor_cache: Array = []
 var _free_slots: PackedInt32Array = PackedInt32Array()
 var _slot_used: PackedByteArray = PackedByteArray()
+## CPU-side map activity from last inject (avoids full i_syn GPU readback for viz).
+var _viz_left: PackedFloat32Array = PackedFloat32Array()
+var _viz_right: PackedFloat32Array = PackedFloat32Array()
+var _viz_median: PackedFloat32Array = PackedFloat32Array()
+var _viz_motor: PackedFloat32Array = PackedFloat32Array()
+
+var _param_inj: PackedByteArray = PackedByteArray()
+var _param_int: PackedByteArray = PackedByteArray()
+var _param_syn: PackedByteArray = PackedByteArray()
+var _param_mot: PackedByteArray = PackedByteArray()
 
 
 static func get_engine() -> GpuLifEngine:
@@ -118,18 +132,32 @@ func setup(template: NeuralNetwork, p_max_agents: int) -> bool:
 	t_ref = template.t_ref
 
 	var total := n_neurons * max_agents
-	_drive_cpu = PackedInt32Array()
-	_drive_cpu.resize(total)
-	_drive_cpu.fill(0)
+	_drive_bytes = PackedByteArray()
+	_drive_bytes.resize(total * 4)
+	_drive_bytes.fill(0)
+	_dirty = PackedInt32Array()
 	_last_spikes = PackedInt32Array()
 	_last_spikes.resize(max_agents)
 	_last_spikes.fill(0)
+	_viz_left.resize(max_agents)
+	_viz_right.resize(max_agents)
+	_viz_median.resize(max_agents)
+	_viz_motor.resize(max_agents)
+	_viz_left.fill(0.0)
+	_viz_right.fill(0.0)
+	_viz_median.fill(0.0)
+	_viz_motor.fill(0.0)
 	_motor_cache.clear()
 	for _i in max_agents:
 		var m := PackedFloat32Array()
 		m.resize(CHANNELS)
 		m.fill(0.0)
 		_motor_cache.append(m)
+
+	_param_inj.resize(16)
+	_param_int.resize(40)
+	_param_syn.resize(16)
+	_param_mot.resize(16)
 
 	var zf := PackedFloat32Array()
 	zf.resize(total)
@@ -142,7 +170,7 @@ func setup(template: NeuralNetwork, p_max_agents: int) -> bool:
 	_i_rid = rd.storage_buffer_create(total * 4, zi.to_byte_array())
 	_r_rid = rd.storage_buffer_create(total * 4, zf.to_byte_array())
 	_s_rid = rd.storage_buffer_create(total * 4, zi.to_byte_array())
-	_drive_rid = rd.storage_buffer_create(total * 4, zi.to_byte_array())
+	_drive_rid = rd.storage_buffer_create(total * 4, _drive_bytes)
 	_off_rid = rd.storage_buffer_create(template.csr_offsets.size() * 4, template.csr_offsets.to_byte_array())
 	_tgt_rid = rd.storage_buffer_create(n_synapses * 4, template.csr_targets.to_byte_array())
 	_w_rid = rd.storage_buffer_create(n_synapses * 4, template.csr_weights.to_byte_array())
@@ -245,20 +273,35 @@ func allocate_slot() -> int:
 	if not ready:
 		return -1
 	var slot := -1
+	var recycled := false
 	if not _free_slots.is_empty():
 		slot = _free_slots[_free_slots.size() - 1]
 		_free_slots.resize(_free_slots.size() - 1)
+		recycled = true
 	elif agent_count < max_agents:
 		slot = agent_count
 		agent_count += 1
 	else:
 		return -1
 	_slot_used[slot] = 1
-	# Clear drives for recycled slot.
-	var base := slot * n_neurons
-	for i in n_neurons:
-		_drive_cpu[base + i] = 0
+	# Fresh high-water slots are already zero from setup; only wipe recycled ones.
+	if recycled:
+		_clear_slot_drive(slot)
+	if slot < _viz_left.size():
+		_viz_left[slot] = 0.0
+		_viz_right[slot] = 0.0
+		_viz_median[slot] = 0.0
+		_viz_motor[slot] = 0.0
 	return slot
+
+
+func _clear_slot_drive(slot: int) -> void:
+	# Spawn/recycle only — wipe via int view on a scratch then patch is costly;
+	# zeroing s32 cells in a tight loop is acceptable at birth rate.
+	var base := slot * n_neurons
+	var end := base + n_neurons
+	for flat in range(base, end):
+		_drive_bytes.encode_s32(flat * 4, 0)
 
 
 func release_slot(slot: int) -> void:
@@ -293,11 +336,14 @@ func inject_range(slot: int, ids: PackedInt32Array, offset: int, count: int, amp
 	var base := slot * n_neurons
 	var amp := amp_in * drive_gain
 	var n := mini(count, maxi(0, ids.size() - offset))
+	var add_fp := int(amp * FP)
+	if add_fp == 0:
+		return
 	for i in n:
 		var ni: int = ids[offset + i]
 		if ni < 0 or ni >= n_neurons:
 			continue
-		_drive_cpu[base + ni] += int(amp * FP)
+		_add_drive(base + ni, add_fp)
 
 
 ## Retinotopic injection: one weight per map cell starting at offset.
@@ -316,7 +362,7 @@ func inject_weights(slot: int, ids: PackedInt32Array, offset: int, weights: Pack
 		var ni: int = ids[offset + i]
 		if ni < 0 or ni >= n_neurons:
 			continue
-		_drive_cpu[base + ni] += int(w * FP)
+		_add_drive(base + ni, int(w * FP))
 
 
 func _inject_map(base: int, ids: PackedInt32Array, amp_in: float) -> void:
@@ -328,11 +374,21 @@ func inject_range_at_base(base: int, ids: PackedInt32Array, offset: int, count: 
 		return
 	var amp := amp_in * drive_gain
 	var n := mini(count, maxi(0, ids.size() - offset))
+	var add_fp := int(amp * FP)
+	if add_fp == 0:
+		return
 	for i in n:
 		var ni: int = ids[offset + i]
 		if ni < 0 or ni >= n_neurons:
 			continue
-		_drive_cpu[base + ni] += int(amp * FP)
+		_add_drive(base + ni, add_fp)
+
+
+func _add_drive(flat_idx: int, add_fp: int) -> void:
+	var off := flat_idx * 4
+	var cur := _drive_bytes.decode_s32(off)
+	_drive_bytes.encode_s32(off, cur + add_fp)
+	_dirty.append(flat_idx)
 
 
 func step(dt: float) -> void:
@@ -341,45 +397,41 @@ func step(dt: float) -> void:
 	# Dispatch over allocated high-water mark (includes freed holes; cheap vs realloc).
 	var live_agents := agent_count
 	var total: int = n_neurons * live_agents
-	rd.buffer_update(_drive_rid, 0, _drive_cpu.size() * 4, _drive_cpu.to_byte_array())
+	var upload_bytes := total * 4
+	# Upload only the live high-water region (was: entire max_agents bank).
+	rd.buffer_update(_drive_rid, 0, upload_bytes, _drive_bytes)
 
-	var inj := PackedByteArray()
-	inj.resize(16)
-	inj.encode_u32(0, n_neurons)
-	inj.encode_u32(4, live_agents)
-	rd.buffer_update(_p_inj, 0, inj.size(), inj)
+	_param_inj.encode_u32(0, n_neurons)
+	_param_inj.encode_u32(4, live_agents)
+	rd.buffer_update(_p_inj, 0, 16, _param_inj)
 
 	var inv_tau := 1.0 / maxf(tau_mem, 0.0001)
 	var syn_decay := exp(-dt / maxf(tau_syn, 0.0001))
-	var ip := PackedByteArray()
-	ip.resize(40)
-	ip.encode_float(0, dt)
-	ip.encode_float(4, inv_tau)
-	ip.encode_float(8, syn_decay)
-	ip.encode_float(12, v_rest)
-	ip.encode_float(16, v_thresh)
-	ip.encode_float(20, v_reset)
-	ip.encode_float(24, t_ref)
-	ip.encode_u32(28, n_neurons)
-	ip.encode_u32(32, live_agents)
-	ip.encode_u32(36, 0)
-	rd.buffer_update(_p_int, 0, ip.size(), ip)
+	_param_int.encode_float(0, dt)
+	_param_int.encode_float(4, inv_tau)
+	_param_int.encode_float(8, syn_decay)
+	_param_int.encode_float(12, v_rest)
+	_param_int.encode_float(16, v_thresh)
+	_param_int.encode_float(20, v_reset)
+	_param_int.encode_float(24, t_ref)
+	_param_int.encode_u32(28, n_neurons)
+	_param_int.encode_u32(32, live_agents)
+	_param_int.encode_u32(36, 0)
+	rd.buffer_update(_p_int, 0, 40, _param_int)
 
-	var sp := PackedByteArray()
-	sp.resize(16)
-	sp.encode_float(0, syn_scale)
-	sp.encode_u32(4, n_neurons)
-	sp.encode_u32(8, live_agents)
-	sp.encode_u32(12, MAX_EDGES_PER_SPIKE)
-	rd.buffer_update(_p_syn, 0, sp.size(), sp)
+	_param_syn.encode_float(0, syn_scale)
+	_param_syn.encode_u32(4, n_neurons)
+	_param_syn.encode_u32(8, live_agents)
+	_param_syn.encode_u32(12, MAX_EDGES_PER_SPIKE)
+	rd.buffer_update(_p_syn, 0, 16, _param_syn)
 
-	var mp := PackedByteArray()
-	mp.resize(16)
-	mp.encode_u32(0, n_neurons)
-	mp.encode_u32(4, live_agents)
-	mp.encode_u32(8, maxi(map_motor.size(), 1))
-	mp.encode_u32(12, CHANNELS)
-	rd.buffer_update(_p_mot, 0, mp.size(), mp)
+	_param_mot.encode_u32(0, n_neurons)
+	_param_mot.encode_u32(4, live_agents)
+	_param_mot.encode_u32(8, maxi(map_motor.size(), 1))
+	_param_mot.encode_u32(12, CHANNELS)
+	rd.buffer_update(_p_mot, 0, 16, _param_mot)
+
+	_cache_viz_from_drive(live_agents)
 
 	_dispatch(_pipe_inject, _set_inject, total, 256)
 	_dispatch(_pipe_integrate, _set_integrate, total, 256)
@@ -390,7 +442,53 @@ func step(dt: float) -> void:
 	rd.sync()
 
 	_download_outputs(live_agents)
-	_drive_cpu.fill(0)
+	_clear_drive_dirty(live_agents)
+
+
+func _cache_viz_from_drive(live_agents: int) -> void:
+	## Peak |drive| on ME/LOP/motor maps — no GPU readback needed for HUD bars.
+	for a in live_agents:
+		if a >= max_agents or _slot_used[a] == 0:
+			continue
+		var base := a * n_neurons
+		_viz_left[a] = _peak_drive_map(base, map_left)
+		_viz_right[a] = _peak_drive_map(base, map_right)
+		_viz_median[a] = _peak_drive_map(base, map_median)
+		_viz_motor[a] = _peak_drive_map(base, map_motor)
+
+
+func _peak_drive_map(base: int, ids: PackedInt32Array) -> float:
+	if ids.is_empty():
+		return 0.0
+	var n := mini(128, ids.size())
+	var peak := 0.0
+	var acc := 0.0
+	var used := 0
+	for i in n:
+		var ni: int = ids[i]
+		if ni < 0 or ni >= n_neurons:
+			continue
+		var a := absf(float(_drive_bytes.decode_s32((base + ni) * 4)) / FP)
+		acc += a
+		peak = maxf(peak, a)
+		used += 1
+	if used == 0:
+		return 0.0
+	return clampf(peak / 6.0 + (acc / float(used)) / 12.0, 0.0, 1.5)
+
+
+func _clear_drive_dirty(_live_agents: int) -> void:
+	if _dirty.size() > DIRTY_WIPE_THRESHOLD:
+		# Full memset is cheaper than millions of encode_s32 calls.
+		_drive_bytes.fill(0)
+		_dirty.clear()
+		return
+	for i in _dirty.size():
+		var idx: int = _dirty[i]
+		if idx < 0 or idx * 4 + 4 > _drive_bytes.size():
+			continue
+		_drive_bytes.encode_s32(idx * 4, 0)
+	_dirty.clear()
 
 
 func _dispatch(pipeline: RID, set_rid: RID, count: int, local_x: int) -> void:
@@ -426,8 +524,7 @@ func get_spikes(slot: int) -> int:
 	return _last_spikes[slot]
 
 
-## Sample synaptic drive for live brain viz (selected agent only).
-## |V| stays near 0 (v_rest=0 + reset); i_syn reflects recent eye injection.
+## Sample activity for live brain viz (selected agent only) — no full-buffer readback.
 func sample_activity(slot: int, heat_w: int = 72, heat_h: int = 56) -> Dictionary:
 	var empty := {
 		"act_left": 0.0,
@@ -440,38 +537,26 @@ func sample_activity(slot: int, heat_w: int = 72, heat_h: int = 56) -> Dictionar
 		"heat": PackedByteArray(),
 		"backend": backend_name,
 	}
-	if not ready or rd == null or slot < 0 or slot >= max_agents or _slot_used[slot] == 0:
+	if not ready or slot < 0 or slot >= max_agents or _slot_used[slot] == 0:
 		return empty
-	var base := slot * n_neurons
-	var i_bytes := rd.buffer_get_data(_i_rid, base * 4, n_neurons * 4)
-	var v_bytes := rd.buffer_get_data(_v_rid, base * 4, mini(n_neurons, heat_w * heat_h * 8) * 4)
-	var s_bytes := rd.buffer_get_data(_s_rid, base * 4, mini(n_neurons, 4096) * 4)
 
-	var act_l := _mean_isyn_map(i_bytes, map_left)
-	var act_r := _mean_isyn_map(i_bytes, map_right)
-	var act_m := _mean_isyn_map(i_bytes, map_median)
-	var act_mot := _mean_isyn_map(i_bytes, map_motor)
+	var act_l := _viz_left[slot] if slot < _viz_left.size() else 0.0
+	var act_r := _viz_right[slot] if slot < _viz_right.size() else 0.0
+	var act_m := _viz_median[slot] if slot < _viz_median.size() else 0.0
+	var act_mot := _viz_motor[slot] if slot < _viz_motor.size() else 0.0
 
+	# Cheap procedural heat from map peaks + spikes (heatmap unused by drawer today).
 	var heat := PackedByteArray()
 	heat.resize(heat_w * heat_h * 4)
 	var cells := heat_w * heat_h
-	var stride := maxi(1, int(floor(float(n_neurons) / float(cells))))
+	var pulse := clampf((act_l + act_r + act_m) * 0.45 + act_mot * 0.3, 0.0, 1.0)
+	var spike_boost := 1.0 if get_spikes(slot) > 0 else 0.0
 	for i in cells:
-		var ni := mini(n_neurons - 1, i * stride)
-		var isyn := 0.0
-		if ni * 4 + 4 <= i_bytes.size():
-			isyn = absf(float(i_bytes.decode_s32(ni * 4)) / FP)
-		var vv := 0.0
-		if ni * 4 + 4 <= v_bytes.size():
-			vv = absf(v_bytes.decode_float(ni * 4))
-		var spiked := 0.0
-		if ni < 4096 and ni * 4 + 4 <= s_bytes.size():
-			spiked = 1.0 if s_bytes.decode_u32(ni * 4) != 0 else 0.0
-		var t := clampf(isyn * 0.35 + vv * 1.2 + spiked * 0.55, 0.0, 1.0)
+		var t := clampf(pulse * (0.55 + 0.45 * float((i * 17) % 10) / 10.0) + spike_boost * 0.2, 0.0, 1.0)
 		var o := i * 4
 		heat[o] = int(clampf(40.0 + t * 200.0, 0, 255))
 		heat[o + 1] = int(clampf(30.0 + t * 120.0, 0, 255))
-		heat[o + 2] = int(clampf(60.0 + (1.0 - t) * 80.0 + spiked * 120.0, 0, 255))
+		heat[o + 2] = int(clampf(60.0 + (1.0 - t) * 80.0 + spike_boost * 80.0, 0, 255))
 		heat[o + 3] = 255
 
 	return {
@@ -487,33 +572,13 @@ func sample_activity(slot: int, heat_w: int = 72, heat_h: int = 56) -> Dictionar
 	}
 
 
-func _mean_isyn_map(i_bytes: PackedByteArray, ids: PackedInt32Array) -> float:
-	if ids.is_empty():
-		return 0.0
-	# Cover full ME layout (ON/OFF/HS/VS/expand/mate).
-	var n := mini(128, ids.size())
-	var peak := 0.0
-	var acc := 0.0
-	var used := 0
-	for i in n:
-		var ni: int = ids[i]
-		if ni < 0 or ni * 4 + 4 > i_bytes.size():
-			continue
-		var a := absf(float(i_bytes.decode_s32(ni * 4)) / FP)
-		acc += a
-		peak = maxf(peak, a)
-		used += 1
-	if used == 0:
-		return 0.0
-	# Peak dominates so sparse injection still shows; /6 ≈ full sensory drive scale.
-	return clampf(peak / 6.0 + (acc / float(used)) / 12.0, 0.0, 1.5)
-
-
 func shutdown() -> void:
 	ready = false
 	agent_count = 0
 	_free_slots.clear()
 	_slot_used.clear()
+	_dirty.clear()
+	_drive_bytes.clear()
 	if rd == null:
 		return
 	for rid in [
