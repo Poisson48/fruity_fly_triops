@@ -41,6 +41,50 @@ func update_display(
 	var st := world.stats.as_dict()
 
 	var lines: PackedStringArray = PackedStringArray()
+	if world.config.is_free_flight():
+		lines.append("=== Nage libre — corridor FlyWire ===")
+		lines.append("But: avancer tout droit (-Z), eviter les piliers")
+		lines.append(
+			"Avance: %.1f  |  Record: %.1f  |  derive X: %+.1f"
+			% [
+				world.void_space.forward_progress,
+				world.void_space.best_progress,
+				world.void_space.lateral_error,
+			]
+		)
+		lines.append(
+			"Obstacles: %d  |  tiles: %d"
+			% [world.void_space.obstacle_count, world.void_space.tile_keys.size()]
+		)
+		lines.append("FPS: %.1f | Cam: %s" % [fps, camera_mode])
+		lines.append("Sim: %.1fs | brain %s | %s" % [
+			world.time,
+			world.config.brain_type,
+			"PAUSE" if paused else ("x%.2f" % time_scale),
+		])
+		if not world.agents.is_empty():
+			var a: TriopsAgent = world.agents[0]
+			var pref: float = world.config.flight_preferred_altitude
+			var pkt: SensoryPacket = a.sensors.last_packet
+			var expand := pkt.expand_m if pkt else 0.0
+			lines.append(
+				"alt %.1f (cible %.1f)  loom sol/ciel %.2f/%.2f  obst %.2f"
+				% [
+					a.body.position.y,
+					pref,
+					pkt.floor_loom if pkt else 0.0,
+					pkt.ceiling_loom if pkt else 0.0,
+					expand,
+				]
+			)
+			lines.append(
+				"pos (%.1f, %.1f, %.1f)  spd %.2f"
+				% [a.body.position.x, a.body.position.y, a.body.position.z, a.body.velocity.length()]
+			)
+		label.text = "\n".join(lines)
+		speed_label.text = "PAUSE" if paused else ("x%.2f" % time_scale)
+		return
+
 	lines.append("=== Fruity Fly Triops ===")
 	lines.append("Triops: %d (F:%d M:%d)  eggs: %d  food: %d" % [
 		world.living_count(), sexes.x, sexes.y, world.eggs.size(), world.food.active_count()
@@ -51,10 +95,37 @@ func update_display(
 	])
 	lines.append("Sim: %.1fs | steps %d | brain %s" % [world.time, world.step_count, world.config.brain_type])
 	lines.append(
-		"Evo gen max %d | births %d | deaths %d | eggs %d | meals %d"
-		% [st["max_generation"], st["births"], st["deaths"], st["eggs_laid"], st["meals"]]
+		"Evo gen max %d (avg %.1f) | births %d | deaths %d | eggs %d | meals %d"
+		% [
+			st["max_generation"],
+			st.get("mean_generation", 0.0),
+			st["births"],
+			st["deaths"],
+			st["eggs_laid"],
+			st["meals"],
+		]
 	)
 	lines.append("Avg death age: %.2f days" % st["avg_death_age_days"])
+	if int(st.get("sample_count", 0)) > 0:
+		lines.append(
+			"Traits food/wall/yaw %.2f/%.2f/%.2f depth %.2f body %.2f"
+			% [
+				st.get("mean_sense_food", 0.0),
+				st.get("mean_sense_wall", 0.0),
+				st.get("mean_motor_yaw", 0.0),
+				st.get("mean_depth_pref", 0.0),
+				st.get("mean_body_scale", 0.0),
+			]
+		)
+		lines.append(
+			"LIF syn/drive %.2f/%.2f | plastic %d | drain %.2f"
+			% [
+				st.get("mean_syn_scale", 1.0),
+				st.get("mean_drive_gain", 1.0),
+				st.get("plastic_agents", 0),
+				st.get("mean_energy_drain", 1.0),
+			]
+		)
 	lines.append("Seed: %d" % world.config.seed)
 	lines.append("")
 	lines.append("[RMB/MMB] orbit  [Molette] zoom  [C] recenter  [F] follow")
@@ -86,6 +157,30 @@ func update_display(
 			% [float(sensors.get("food_motivation", 1.0)), float(sensors.get("mate_motivation", 1.0))]
 		)
 		lines.append("motor: %s" % str(info.get("brain_outputs", [])))
+		var ginfo: Dictionary = info.get("genome", {})
+		if not ginfo.is_empty():
+			lines.append(
+				"genes food/wall/yaw %.2f/%.2f/%.2f depth %.2f body %.2f"
+				% [
+					float(ginfo.get("sense_food", 0.0)),
+					float(ginfo.get("sense_wall", 0.0)),
+					float(ginfo.get("motor_yaw", 0.0)),
+					float(ginfo.get("depth_pref", 0.0)),
+					float(ginfo.get("body_scale", 1.0)),
+				]
+			)
+			lines.append(
+				"meta drain/swim/eat/mat %.2f/%.2f/%.2f/%.2f | LIF %.2f/%.2f%s"
+				% [
+					float(ginfo.get("energy_drain_mult", 1.0)),
+					float(ginfo.get("swim_cost_mult", 1.0)),
+					float(ginfo.get("eat_radius_mult", 1.0)),
+					float(ginfo.get("maturity_age_mult", 1.0)),
+					float(ginfo.get("syn_scale_gene", 1.0)),
+					float(ginfo.get("drive_gain_gene", 1.0)),
+					" | plastic" if ginfo.get("plastic_syn", false) else "",
+				]
+			)
 		var brain_info: Dictionary = info.get("brain", {})
 		lines.append(
 			"brain %s | spikes %s | neurons %s"

@@ -22,6 +22,7 @@ func _boot() -> void:
 	_test_perf_easy()
 	_test_survival()
 	_test_reproduce()
+	_test_evolution_smoke()
 
 	var ok := _failures.is_empty()
 	print("=== SUITE_OK=", ok, " backend=", _backend, " gpu=", _gpu, " ===")
@@ -171,5 +172,39 @@ func _test_reproduce() -> void:
 		_pass(
 			"reproduce meals=%d eggs=%d living=%d"
 			% [world.stats.meals, world.stats.eggs_laid, world.living_count()]
+		)
+	GpuLifEngine.get_engine().shutdown()
+
+
+func _test_evolution_smoke() -> void:
+	print("--- evolution_smoke ---")
+	var world := _make_world(42)
+	world.config.connectome_evolution_enabled = true
+	world.config.mutation_rate = 0.35
+	world.config.mutation_scale = 0.25
+	# Re-init so founders get sparse loci.
+	var cfg := world.config
+	world.initialize(cfg)
+	var seconds := 20.0 if _gpu else 12.0
+	var steps := int(seconds / PHYS_DT)
+	for _i in steps:
+		world.step(PHYS_DT)
+	world.stats.sample_population(world.agents)
+	var st := world.stats.as_dict()
+	print(
+		"DONE gen_max=", st["max_generation"],
+		" mean_gen=", st["mean_generation"],
+		" eggs=", st["eggs_laid"],
+		" plastic=", st["plastic_agents"],
+		" living=", world.living_count()
+	)
+	if world.living_count() < 1:
+		_fail("evolution_smoke: colony dead")
+	elif float(st.get("mean_body_scale", 0.0)) <= 0.0:
+		_fail("evolution_smoke: no body_scale sample")
+	else:
+		_pass(
+			"evolution_smoke gen=%d body=%.2f plastic=%d"
+			% [st["max_generation"], st["mean_body_scale"], st["plastic_agents"]]
 		)
 	GpuLifEngine.get_engine().shutdown()

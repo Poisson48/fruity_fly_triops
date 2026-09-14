@@ -1,6 +1,7 @@
 extends SceneTree
-## Trace one Triops trajectory + behavior markers for coherence analysis.
-## Writes CSV + summary JSON under user:// then copies to project res://data/debug/
+## Trace one Triops path and flag motion incoherences.
+## Writes CSV + PNG trail + JSON report under res://data/debug/
+
 
 func _init() -> void:
 	call_deferred("_boot")
@@ -25,19 +26,32 @@ func _boot() -> void:
 	print("TRACE target id=", tid, " sex=", ("M" if target.sex == TriopsAgent.Sex.MALE else "F"), " backend=", eng.backend_name)
 
 	var csv := PackedStringArray()
-	csv.append("t,x,y,z,vx,vy,vz,speed,energy,health,yaw,food_l,food_r,food_m,mate_l,mate_r,wall_m,fwd,yaw_cmd,ate,near_food,near_mate,near_wall")
+	csv.append(
+		"t,x,y,z,vx,vy,vz,speed,step_dist,yaw,pitch,yaw_rate,heading_align,fwd,yaw_cmd,energy,flags"
+	)
 
-	var ate_events := 0
-	var wall_hits := 0
-	var prev_near_wall := false
-	var food_approach_frames := 0
-	var mate_approach_frames := 0
+	var xs: Array[float] = []
+	var zs: Array[float] = []
+	var flag_teleport := 0
+	var flag_spin := 0
+	var flag_jitter := 0
+	var flag_align := 0
+	var flag_bounce := 0
 	var total_dist := 0.0
+	var net_disp := 0.0
+	var max_step := 0.0
+	var max_yaw_rate := 0.0
+	var spikes: Array[Dictionary] = []
+
 	var prev_pos: Vector3 = target.body.position
-	var steps := 3600  # 60s
+	var prev_yaw: float = target.body.orientation.get_euler().y
+	var start_pos: Vector3 = prev_pos
+	var dt: float = cfg.simulation_dt
+	var steps := 3600  # 60s @ 60 Hz
+	var half := cfg.aquarium_half_extents
 
 	for i in steps:
-		world.step(cfg.simulation_dt)
+		world.step(dt)
 		target = world.get_agent_by_id(tid)
 		if target == null or not target.alive:
 			print("target died or missing at t=", world.time)
@@ -45,109 +59,211 @@ func _boot() -> void:
 
 		var p: Vector3 = target.body.position
 		var v: Vector3 = target.body.velocity
-		total_dist += p.distance_to(prev_pos)
-		prev_pos = p
-
-		var sens := target.sensors.last_packet
-		var fl := _ch(sens.left_eye, 1)
-		var fr := _ch(sens.right_eye, 1)
-		var fm := _ch(sens.median_eye, 1)
-		var ml := _ch(sens.left_eye, 2)
-		var mr := _ch(sens.right_eye, 2)
-		var wm := _ch(sens.median_eye, 0)
-		var outs: PackedFloat32Array = target.brain.get_outputs()
-		var fwd := outs[0] if outs.size() > 0 else 0.0
-		var yawc := outs[2] if outs.size() > 2 else 0.0
-
-		var near_food := _nearest_food_dist(world, p) < 2.5
-		var near_mate := _nearest_mate_dist(world, target) < 3.0
-		var half := cfg.aquarium_half_extents
-		var near_wall := (
-			absf(p.x) > half.x - 0.8
-			or absf(p.y) > half.y - 0.8
-			or absf(p.z) > half.z - 0.8
-		)
-		if near_wall and not prev_near_wall:
-			wall_hits += 1
-		prev_near_wall = near_wall
-
-		# Approaching food: food signal rising while moving somewhat toward it
-		if fl + fr + fm > 0.35 and fwd > 0.1:
-			food_approach_frames += 1
-		if ml + mr > 0.25 and fwd > 0.05:
-			mate_approach_frames += 1
-		if target.last_ate:
-			ate_events += 1
-
 		var euler: Vector3 = target.body.orientation.get_euler()
+		var step_dist := p.distance_to(prev_pos)
+		total_dist += step_dist
+		max_step = maxf(max_step, step_dist)
+
+		var dyaw := _angle_delta(prev_yaw, euler.y)
+		var yaw_rate := absf(dyaw) / dt
+		max_yaw_rate = maxf(max_yaw_rate, yaw_rate)
+
+		var fwd := -target.body.orientation.z
+		var heading_align := 0.0
+		if v.length() > 0.15:
+			heading_align = fwd.dot(v.normalized())
+
+		var outs: PackedFloat32Array = target.brain.get_outputs() if target.brain else PackedFloat32Array()
+		var cmd_fwd := outs[0] if outs.size() > 0 else 0.0
+		var cmd_yaw := outs[2] if outs.size() > 2 else 0.0
+
+		var flags := ""
+		# Teleport / wall slap: step much larger than max_speed * dt allows.
+		var max_reasonable := cfg.max_speed * dt * 2.5 + 0.05
+		if step_dist > max_reasonable:
+			flag_teleport += 1
+			flags += "TELEPORT;"
+			spikes.append({"t": world.time, "kind": "teleport", "step": step_dist, "pos": [p.x, p.y, p.z]})
+		# Wild spin: > ~540°/s sustained spike
+		if yaw_rate > 9.0:
+			flag_spin += 1
+			flags += "SPIN;"
+			if spikes.size() < 80:
+				spikes.append({"t": world.time, "kind": "spin", "yaw_rate": yaw_rate})
+		# High-freq jitter: tiny moves with huge yaw changes
+		if step_dist < 0.02 and yaw_rate > 4.0 and v.length() > 0.2:
+			flag_jitter += 1
+			flags += "JITTER;"
+		# Swimming sideways / backwards hard
+		if v.length() > 0.4 and heading_align < -0.25:
+			flag_align += 1
+			flags += "ANTI_ALIGN;"
+		# Corner pinball
+		var margin := 0.55
+		if (
+			(absf(p.x) > half.x - margin or absf(p.z) > half.z - margin or absf(p.y) > half.y - margin)
+			and step_dist > cfg.max_speed * dt * 1.2
+		):
+			flag_bounce += 1
+			flags += "BOUNCE;"
+
+		xs.append(p.x)
+		zs.append(p.z)
 		csv.append(
-			"%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%d,%d,%d"
+			"%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.5f,%.4f,%.4f,%.3f,%.3f,%.3f,%.3f,%.3f,%s"
 			% [
-				world.time, p.x, p.y, p.z, v.x, v.y, v.z, v.length(),
-				target.energy, target.health, euler.y,
-				fl, fr, fm, ml, mr, wm, fwd, yawc,
-				1 if target.last_ate else 0,
-				1 if near_food else 0,
-				1 if near_mate else 0,
-				1 if near_wall else 0,
+				world.time, p.x, p.y, p.z, v.x, v.y, v.z, v.length(), step_dist,
+				euler.y, euler.x, yaw_rate, heading_align, cmd_fwd, cmd_yaw, target.energy, flags
 			]
 		)
+		prev_pos = p
+		prev_yaw = euler.y
 
-	var path := "user://triops_trace_%d.csv" % tid
-	var f := FileAccess.open(path, FileAccess.WRITE)
+	net_disp = start_pos.distance_to(prev_pos)
+	var straight := net_disp / maxf(total_dist, 0.001)
+
+	var proj := ProjectSettings.globalize_path("res://data/debug")
+	DirAccess.make_dir_recursive_absolute(proj)
+	var csv_path := proj.path_join("triops_trace.csv")
+	var f := FileAccess.open(csv_path, FileAccess.WRITE)
 	f.store_string("\n".join(csv))
 	f.close()
 
-	# Also write under project for plotting tools.
-	var proj := ProjectSettings.globalize_path("res://data/debug")
-	DirAccess.make_dir_recursive_absolute(proj)
-	var proj_csv := proj.path_join("triops_trace.csv")
-	var abs_user := ProjectSettings.globalize_path(path)
-	DirAccess.copy_absolute(abs_user, proj_csv)
+	var png_path := proj.path_join("triops_trace_xz.png")
+	_write_trail_png(png_path, xs, zs, half, spikes)
 
-	var living := world.living_count()
 	var summary := {
 		"target_id": tid,
 		"duration_s": world.time,
 		"path_length": total_dist,
-		"ate_events": ate_events,
-		"wall_entries": wall_hits,
-		"food_approach_frames": food_approach_frames,
-		"mate_approach_frames": mate_approach_frames,
-		"final_energy": target.energy if target else -1.0,
+		"net_displacement": net_disp,
+		"straightness": straight,
+		"max_step_dist": max_step,
+		"max_yaw_rate": max_yaw_rate,
+		"flags": {
+			"teleport": flag_teleport,
+			"spin": flag_spin,
+			"jitter": flag_jitter,
+			"anti_align": flag_align,
+			"bounce": flag_bounce,
+		},
+		"spikes_sample": spikes.slice(0, mini(spikes.size(), 25)),
+		"csv": csv_path,
+		"png": png_path,
 		"alive": target != null and target.alive,
-		"world_meals": world.stats.meals,
-		"world_eggs": world.stats.eggs_laid,
-		"living": living,
-		"csv": proj_csv,
+		"backend": eng.backend_name,
 	}
+	print("=== TRACE REPORT ===")
+	print("path=%.1f net=%.1f straightness=%.3f max_step=%.3f max_yaw_rate=%.1f" % [total_dist, net_disp, straight, max_step, max_yaw_rate])
+	print(
+		"flags teleport=%d spin=%d jitter=%d anti_align=%d bounce=%d"
+		% [flag_teleport, flag_spin, flag_jitter, flag_align, flag_bounce]
+	)
+	for s in spikes.slice(0, mini(spikes.size(), 12)):
+		print("  spike ", s)
 	print("SUMMARY ", JSON.stringify(summary))
 	var sf := FileAccess.open(proj.path_join("triops_trace_summary.json"), FileAccess.WRITE)
 	sf.store_string(JSON.stringify(summary, "\t"))
 	sf.close()
+	print("wrote ", csv_path)
+	print("wrote ", png_path)
 
 	eng.shutdown()
 	quit(0)
 
 
-func _ch(arr: PackedFloat32Array, i: int) -> float:
-	return arr[i] if i < arr.size() else 0.0
+func _angle_delta(a: float, b: float) -> float:
+	var d := b - a
+	while d > PI:
+		d -= TAU
+	while d < -PI:
+		d += TAU
+	return d
 
 
-func _nearest_food_dist(world: SimulationWorld, p: Vector3) -> float:
-	var best := 1e9
-	var food := world.food
-	for i in food.positions.size():
-		if food.active[i] == 0:
+func _write_trail_png(path: String, xs: Array[float], zs: Array[float], half: Vector3, spikes: Array) -> void:
+	var w := 900
+	var h := 900
+	var img := Image.create(w, h, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0.07, 0.09, 0.12, 1))
+	var margin := 40.0
+	var sx := (float(w) - 2.0 * margin) / maxf(half.x * 2.0, 0.01)
+	var sz := (float(h) - 2.0 * margin) / maxf(half.z * 2.0, 0.01)
+
+	# Border
+	var b0 := _to_px(-half.x, -half.z, half, margin, sx, sz, w, h)
+	var b1 := _to_px(half.x, half.z, half, margin, sx, sz, w, h)
+	_rect(img, b0, b1, Color(0.35, 0.4, 0.5, 1))
+
+	# Path
+	for i in range(1, xs.size()):
+		var a := _to_px(xs[i - 1], zs[i - 1], half, margin, sx, sz, w, h)
+		var b := _to_px(xs[i], zs[i], half, margin, sx, sz, w, h)
+		var t := float(i) / float(maxi(xs.size() - 1, 1))
+		var col := Color(0.2 + 0.6 * t, 0.85 - 0.4 * t, 0.35 + 0.4 * t, 1)
+		_line(img, a, b, col)
+
+	# Start / end
+	if xs.size() > 0:
+		var s := _to_px(xs[0], zs[0], half, margin, sx, sz, w, h)
+		_dot(img, s, 4, Color(0.2, 1.0, 0.4, 1))
+		var e := _to_px(xs[xs.size() - 1], zs[xs.size() - 1], half, margin, sx, sz, w, h)
+		_dot(img, e, 4, Color(1.0, 0.3, 0.2, 1))
+
+	# Spike markers (teleports)
+	for sp in spikes:
+		if str(sp.get("kind", "")) != "teleport":
 			continue
-		best = minf(best, p.distance_to(food.positions[i]))
-	return best
+		var pos: Variant = sp.get("pos", [])
+		if pos is Array and (pos as Array).size() >= 3:
+			var arr := pos as Array
+			var pt := _to_px(float(arr[0]), float(arr[2]), half, margin, sx, sz, w, h)
+			_dot(img, pt, 5, Color(1.0, 0.9, 0.1, 1))
+
+	img.save_png(path)
 
 
-func _nearest_mate_dist(world: SimulationWorld, me: TriopsAgent) -> float:
-	var best := 1e9
-	for a in world.agents:
-		if a.id == me.id or not a.alive or a.sex == me.sex:
-			continue
-		best = minf(best, me.body.position.distance_to(a.body.position))
-	return best
+func _to_px(x: float, z: float, half: Vector3, margin: float, sx: float, sz: float, w: int, h: int) -> Vector2i:
+	var px := int(margin + (x + half.x) * sx)
+	var py := int(margin + (z + half.z) * sz)
+	return Vector2i(clampi(px, 0, w - 1), clampi(py, 0, h - 1))
+
+
+func _dot(img: Image, c: Vector2i, r: int, col: Color) -> void:
+	for y in range(c.y - r, c.y + r + 1):
+		for x in range(c.x - r, c.x + r + 1):
+			if x < 0 or y < 0 or x >= img.get_width() or y >= img.get_height():
+				continue
+			if Vector2(x - c.x, y - c.y).length() <= float(r):
+				img.set_pixel(x, y, col)
+
+
+func _rect(img: Image, a: Vector2i, b: Vector2i, col: Color) -> void:
+	_line(img, Vector2i(a.x, a.y), Vector2i(b.x, a.y), col)
+	_line(img, Vector2i(b.x, a.y), Vector2i(b.x, b.y), col)
+	_line(img, Vector2i(b.x, b.y), Vector2i(a.x, b.y), col)
+	_line(img, Vector2i(a.x, b.y), Vector2i(a.x, a.y), col)
+
+
+func _line(img: Image, a: Vector2i, b: Vector2i, col: Color) -> void:
+	var x0 := a.x
+	var y0 := a.y
+	var x1 := b.x
+	var y1 := b.y
+	var dx := absi(x1 - x0)
+	var dy := -absi(y1 - y0)
+	var sx := 1 if x0 < x1 else -1
+	var sy := 1 if y0 < y1 else -1
+	var err := dx + dy
+	while true:
+		if x0 >= 0 and y0 >= 0 and x0 < img.get_width() and y0 < img.get_height():
+			img.set_pixel(x0, y0, col)
+		if x0 == x1 and y0 == y1:
+			break
+		var e2 := 2 * err
+		if e2 >= dy:
+			err += dy
+			x0 += sx
+		if e2 <= dx:
+			err += dx
+			y0 += sy

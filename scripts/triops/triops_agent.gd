@@ -51,15 +51,19 @@ func setup(
 	var pos: Vector3
 	if typeof(spawn_pos) == TYPE_VECTOR3:
 		pos = spawn_pos
+	elif config.is_free_flight():
+		pos = Vector3(0.0, 4.0, 0.0)
 	else:
+		# Keep spawn clear of floor/ceiling so peel doesn't fight birth dive.
 		pos = Vector3(
 			rng.randf_range(-half.x, half.x),
-			rng.randf_range(-half.y, half.y),
+			rng.randf_range(-half.y * 0.55, half.y * 0.55),
 			rng.randf_range(-half.z, half.z)
 		)
-	var yaw := rng.randf_range(0.0, TAU)
-	var pitch := rng.randf_range(-0.85, 0.85)
+	var yaw := 0.0 if config.is_free_flight() else rng.randf_range(0.0, TAU)
+	var pitch := 0.0 if config.is_free_flight() else rng.randf_range(-0.35, 0.35)
 	body.reset(pos, Basis.from_euler(Vector3(pitch, yaw, 0.0)))
+	motor.configure_for_mode(config)
 	_update_scale(config)
 
 
@@ -76,6 +80,7 @@ func step(
 	mating_cooldown = maxf(0.0, mating_cooldown - delta)
 	_update_scale(config)
 
+	sensors.apply_config(config)
 	var sensory := sensors.sense(
 		body.position,
 		body.orientation,
@@ -85,7 +90,8 @@ func step(
 		mate_positions,
 		config.mate_sense_radius,
 		body.velocity,
-		config.food_sense_radius
+		config.food_sense_radius,
+		scale
 	)
 	sensory.apply_energy_motivation(energy)
 	sensors.last_packet = sensory
@@ -93,11 +99,15 @@ func step(
 	var cmd := motor.decode(outputs)
 	body.apply_motor(cmd, config, delta)
 
-	# Metabolism (V2): drain + swimming cost — no scripted foraging.
-	var move_cost: float = body.velocity.length() * config.swim_energy_cost * delta
-	energy -= config.energy_drain_per_second * delta + move_cost
+	var drain_m := genome.energy_drain_mult if genome else 1.0
+	var swim_m := genome.swim_cost_mult if genome else 1.0
+	var eat_m := genome.eat_radius_mult if genome else 1.0
 
-	var gained := food.try_eat(body.position, config.eat_radius * scale, config)
+	# Metabolism (V2): drain + swimming cost — no scripted foraging.
+	var move_cost: float = body.velocity.length() * config.swim_energy_cost * swim_m * delta
+	energy -= config.energy_drain_per_second * drain_m * delta + move_cost
+
+	var gained := food.try_eat(body.position, config.eat_radius * scale * eat_m, config)
 	last_ate = gained > 0.0
 	if last_ate:
 		energy = minf(1.5, energy + gained)
@@ -117,7 +127,8 @@ func step(
 
 func _update_scale(config: SimulationConfig) -> void:
 	var t := clampf(age_days(config) / maxf(config.mature_age_days, 0.01), 0.0, 1.0)
-	scale = lerpf(config.min_scale, config.max_scale, t)
+	var body_s := genome.body_scale if genome else 1.0
+	scale = lerpf(config.min_scale, config.max_scale, t) * body_s
 
 
 func age_days(config: SimulationConfig) -> float:
@@ -127,7 +138,8 @@ func age_days(config: SimulationConfig) -> float:
 
 
 func is_mature(config: SimulationConfig) -> bool:
-	return age_days(config) >= config.mature_age_days
+	var mat_m := genome.maturity_age_mult if genome else 1.0
+	return age_days(config) >= config.mature_age_days * mat_m
 
 
 func can_mate(config: SimulationConfig) -> bool:
@@ -141,6 +153,26 @@ func can_mate(config: SimulationConfig) -> bool:
 
 func get_debug_state() -> Dictionary:
 	var sensory := sensors.last_packet
+	var ginfo := {}
+	if genome:
+		ginfo = {
+			"depth_pref": genome.depth_pref,
+			"body_scale": genome.body_scale,
+			"energy_drain_mult": genome.energy_drain_mult,
+			"swim_cost_mult": genome.swim_cost_mult,
+			"eat_radius_mult": genome.eat_radius_mult,
+			"maturity_age_mult": genome.maturity_age_mult,
+			"syn_scale_gene": genome.syn_scale_gene,
+			"drive_gain_gene": genome.drive_gain_gene,
+			"sense_food": genome.sense_gains[0] if genome.sense_gains.size() > 0 else 0.0,
+			"sense_wall": genome.sense_gains[1] if genome.sense_gains.size() > 1 else 0.0,
+			"motor_yaw": (
+				genome.motor_gains[MotorInterface.CHANNEL_YAW]
+				if genome.motor_gains.size() > MotorInterface.CHANNEL_YAW
+				else 0.0
+			),
+			"plastic_syn": genome.has_plastic_synapses(),
+		}
 	return {
 		"id": id,
 		"alive": alive,
@@ -162,4 +194,5 @@ func get_debug_state() -> Dictionary:
 		},
 		"brain_outputs": Array(brain.get_outputs()) if brain else [],
 		"brain": brain.get_debug_info() if brain else {},
+		"genome": ginfo,
 	}

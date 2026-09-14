@@ -30,7 +30,12 @@ func _build_form() -> void:
 	_add_section("Presets")
 	var preset_row := HBoxContainer.new()
 	preset_row.add_theme_constant_override("separation", 8)
-	for item in [["Easy (survie)", "easy"], ["Balanced", "balanced"], ["Harsh", "harsh"]]:
+	for item in [
+		["Easy (survie)", "easy"],
+		["Balanced", "balanced"],
+		["Harsh", "harsh"],
+		["Nage libre (vol mouche)", "free_flight"],
+	]:
 		var b := Button.new()
 		b.text = item[0]
 		var key: String = item[1]
@@ -65,6 +70,11 @@ func _build_form() -> void:
 	_add_float("eye_ray_length", "Portée yeux")
 	_add_float("food_sense_radius", "Rayon détection nourriture")
 	_add_float("mate_sense_radius", "Rayon détection partenaire")
+	_add_float("eye_compound_fov_h_deg", "FOV composé H (°)")
+	_add_float("eye_compound_fov_v_deg", "FOV composé V (°)")
+	_add_float("eye_compound_cant_deg", "Cant yeux L/R (°)")
+	_add_float("eye_median_fov_h_deg", "FOV médian H (°)")
+	_add_float("eye_median_fov_v_deg", "FOV médian V (°)")
 
 	_add_section("Nourriture (V1)")
 	_add_int("food_count", "Nombre de particules")
@@ -94,6 +104,7 @@ func _build_form() -> void:
 	_add_float("mutation_rate", "Taux mutation")
 	_add_float("mutation_scale", "Amplitude mutation")
 	_add_bool("crossover_enabled", "Crossover ON")
+	_add_bool("connectome_evolution_enabled", "Évolution connectome (sparse SEZ)")
 
 
 func _add_section(title: String) -> void:
@@ -185,6 +196,11 @@ func _write_form_from_config() -> void:
 	_set_num("eye_ray_length", _config.eye_ray_length)
 	_set_num("food_sense_radius", _config.food_sense_radius)
 	_set_num("mate_sense_radius", _config.mate_sense_radius)
+	_set_num("eye_compound_fov_h_deg", _config.eye_compound_fov_h_deg)
+	_set_num("eye_compound_fov_v_deg", _config.eye_compound_fov_v_deg)
+	_set_num("eye_compound_cant_deg", _config.eye_compound_cant_deg)
+	_set_num("eye_median_fov_h_deg", _config.eye_median_fov_h_deg)
+	_set_num("eye_median_fov_v_deg", _config.eye_median_fov_v_deg)
 	_set_num("food_count", _config.food_count)
 	_set_num("food_energy", _config.food_energy)
 	_set_num("eat_radius", _config.eat_radius)
@@ -206,6 +222,7 @@ func _write_form_from_config() -> void:
 	_set_num("mutation_rate", _config.mutation_rate)
 	_set_num("mutation_scale", _config.mutation_scale)
 	_set_bool("crossover_enabled", _config.crossover_enabled)
+	_set_bool("connectome_evolution_enabled", _config.connectome_evolution_enabled)
 
 
 func _read_form_into_config() -> void:
@@ -229,6 +246,11 @@ func _read_form_into_config() -> void:
 	_config.eye_ray_length = _get_num("eye_ray_length")
 	_config.food_sense_radius = _get_num("food_sense_radius")
 	_config.mate_sense_radius = _get_num("mate_sense_radius")
+	_config.eye_compound_fov_h_deg = _get_num("eye_compound_fov_h_deg")
+	_config.eye_compound_fov_v_deg = _get_num("eye_compound_fov_v_deg")
+	_config.eye_compound_cant_deg = _get_num("eye_compound_cant_deg")
+	_config.eye_median_fov_h_deg = _get_num("eye_median_fov_h_deg")
+	_config.eye_median_fov_v_deg = _get_num("eye_median_fov_v_deg")
 	_config.food_count = int(_get_num("food_count"))
 	_config.food_energy = _get_num("food_energy")
 	_config.eat_radius = _get_num("eat_radius")
@@ -250,6 +272,7 @@ func _read_form_into_config() -> void:
 	_config.mutation_rate = _get_num("mutation_rate")
 	_config.mutation_scale = _get_num("mutation_scale")
 	_config.crossover_enabled = _get_bool("crossover_enabled")
+	_config.connectome_evolution_enabled = _get_bool("connectome_evolution_enabled")
 
 
 func _set_num(key: String, value: float) -> void:
@@ -299,6 +322,9 @@ func _on_preset(kind: String) -> void:
 		"harsh":
 			_config.apply_preset_harsh()
 			status.text = "Preset Harsh chargé — sélection forte."
+		"free_flight":
+			_config.apply_preset_free_flight()
+			status.text = "Nage libre — 1 mouche FlyWire (peau Triops), vide procédural, immortelle."
 		_:
 			_config.apply_preset_balanced()
 			status.text = "Preset Balanced chargé."

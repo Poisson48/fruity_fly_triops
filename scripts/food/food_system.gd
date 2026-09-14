@@ -79,6 +79,19 @@ func prepare_queries() -> void:
 		_rebuild_grid()
 
 
+func sync_landmarks(landmarks: PackedVector3Array, energy: float = 0.4) -> void:
+	## Free-flight: procedural void markers act as visual figures (not edible meals).
+	positions = landmarks.duplicate()
+	amounts.resize(positions.size())
+	respawn_timers.resize(positions.size())
+	active.resize(positions.size())
+	for i in positions.size():
+		amounts[i] = energy
+		respawn_timers[i] = 9999.0
+		active[i] = 1
+	_rebuild_grid()
+
+
 ## Indices of active food within radius (axis-aligned cell neighborhood).
 ## Call prepare_queries() on the main thread before parallel reads.
 func nearby_indices(origin: Vector3, radius: float) -> PackedInt32Array:
@@ -107,6 +120,9 @@ func ray_food_signal(origin: Vector3, direction: Vector3, ray_length: float) -> 
 	return ray_food_signal_candidates(origin, direction, ray_length, nearby_indices(origin, ray_length))
 
 
+const MAX_FOOD_RAY_CANDIDATES := 24
+
+
 func ray_food_signal_candidates(
 	origin: Vector3,
 	direction: Vector3,
@@ -115,7 +131,8 @@ func ray_food_signal_candidates(
 ) -> float:
 	var dir := direction.normalized()
 	var best := 0.0
-	for j in candidates.size():
+	var n := mini(candidates.size(), MAX_FOOD_RAY_CANDIDATES)
+	for j in n:
 		var i: int = candidates[j]
 		if active[i] == 0:
 			continue

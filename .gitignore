@@ -11,3 +11,5 @@ ressources/*.feather
 
 # Local debug traces / smoke outputs
 data/debug/
+
+.captures/

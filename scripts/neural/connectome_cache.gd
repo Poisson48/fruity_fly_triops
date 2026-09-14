@@ -3,6 +3,7 @@ extends Object
 ## Shared FFC topology cache (CSR shared; each brain clones membrane state).
 
 static var _cache: Dictionary = {}
+static var _motor_synapse_ids: Dictionary = {}
 
 
 static func get_template(path: String) -> NeuralNetwork:
@@ -33,5 +34,17 @@ static func get_template(path: String) -> NeuralNetwork:
 	return net
 
 
+static func get_motor_synapse_loci(path: String, k: int, rng: RandomNumberGenerator) -> PackedInt32Array:
+	## Stable shared SEZ/motor CSR indices for sparse connectome evolution.
+	var key := "%s#%d" % [path, k]
+	if _motor_synapse_ids.has(key):
+		return _motor_synapse_ids[key]
+	var template := get_template(path)
+	var ids := template.sample_motor_synapse_ids(k, rng)
+	_motor_synapse_ids[key] = ids
+	return ids
+
+
 static func clear() -> void:
 	_cache.clear()
+	_motor_synapse_ids.clear()

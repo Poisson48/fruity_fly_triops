@@ -44,6 +44,9 @@ class Gains:
 	var contra: float = 1.35
 	var flow: float = 1.25
 	var expand: float = 1.55
+	var depth_pref: float = 0.0
+	## Phase C — scales inject amplitude (GPU-friendly proxy for drive_gain_gene).
+	var drive_scale: float = 1.0
 
 
 static func gains_from_genome(genome: BrainGenome) -> Gains:
@@ -60,32 +63,38 @@ static func gains_from_genome(genome: BrainGenome) -> Gains:
 		g.flow = genome.sense_gains[6]
 	if genome.sense_gains.size() > 7:
 		g.expand = genome.sense_gains[7]
+	g.depth_pref = genome.depth_pref
+	g.drive_scale = clampf(genome.drive_gain_gene, 0.55, 1.55)
 	return g
 
 
 static func apply(network: NeuralNetwork, packet: SensoryPacket, genome: BrainGenome = null) -> void:
 	var g := gains_from_genome(genome)
+	var ds := g.drive_scale
 	_apply_me(network, network.map_left, packet.left_on, packet.left_off, packet.left_mate, packet.left_flow_h, packet.left_flow_v, packet.expand_l, packet.contrast_l, g, true)
 	_apply_me(network, network.map_right, packet.right_on, packet.right_off, packet.right_mate, packet.right_flow_h, packet.right_flow_v, packet.expand_r, packet.contrast_r, g, true)
 	# Contralateral OFF cross-talk (loom asymmetry → opposite ME).
-	_inject_field(network, network.map_right, ME_OFF, packet.left_off, g.wall * g.contra * 0.45)
-	_inject_field(network, network.map_left, ME_OFF, packet.right_off, g.wall * g.contra * 0.45)
+	_inject_field(network, network.map_right, ME_OFF, packet.left_off, g.wall * g.contra * 0.45 * ds)
+	_inject_field(network, network.map_left, ME_OFF, packet.right_off, g.wall * g.contra * 0.45 * ds)
 	_apply_lop(network, network.map_median, packet, g)
 	# Weak tonic so ME doesn't go silent in open water.
-	_inject_uniform(network, network.map_left, ME_MISC, 8, g.tonic)
-	_inject_uniform(network, network.map_right, ME_MISC, 8, g.tonic)
+	_inject_uniform(network, network.map_left, ME_MISC, 8, g.tonic * ds)
+	_inject_uniform(network, network.map_right, ME_MISC, 8, g.tonic * ds)
 	_drive_motor_goals_cpu(network, packet, g)
 
 
 static func apply_gpu(engine: GpuLifEngine, slot: int, packet: SensoryPacket, genome: BrainGenome = null) -> void:
 	var g := gains_from_genome(genome)
+	# Soft GPU proxy for syn_scale_gene (shared CSR cannot vary per agent).
+	if genome:
+		g.drive_scale *= clampf(genome.syn_scale_gene, 0.55, 1.55)
 	_apply_me_gpu(engine, slot, engine.map_left, packet.left_on, packet.left_off, packet.left_mate, packet.left_flow_h, packet.left_flow_v, packet.expand_l, packet.contrast_l, g)
 	_apply_me_gpu(engine, slot, engine.map_right, packet.right_on, packet.right_off, packet.right_mate, packet.right_flow_h, packet.right_flow_v, packet.expand_r, packet.contrast_r, g)
-	engine.inject_weights(slot, engine.map_right, ME_OFF, packet.left_off, g.wall * g.contra * 0.45)
-	engine.inject_weights(slot, engine.map_left, ME_OFF, packet.right_off, g.wall * g.contra * 0.45)
+	engine.inject_weights(slot, engine.map_right, ME_OFF, packet.left_off, g.wall * g.contra * 0.45 * g.drive_scale)
+	engine.inject_weights(slot, engine.map_left, ME_OFF, packet.right_off, g.wall * g.contra * 0.45 * g.drive_scale)
 	_apply_lop_gpu(engine, slot, packet, g)
-	engine.inject_range(slot, engine.map_left, ME_MISC, 8, g.tonic)
-	engine.inject_range(slot, engine.map_right, ME_MISC, 8, g.tonic)
+	engine.inject_range(slot, engine.map_left, ME_MISC, 8, g.tonic * g.drive_scale)
+	engine.inject_range(slot, engine.map_right, ME_MISC, 8, g.tonic * g.drive_scale)
 	_drive_motor_goals_gpu(engine, slot, packet, g)
 
 
@@ -109,14 +118,15 @@ static func _apply_me(
 	g: Gains,
 	_ipsi: bool
 ) -> void:
-	_inject_field(network, ids, ME_ON, on_f, g.food)
-	_inject_field(network, ids, ME_OFF, off_f, g.wall)
+	var ds := g.drive_scale
+	_inject_field(network, ids, ME_ON, on_f, g.food * ds)
+	_inject_field(network, ids, ME_OFF, off_f, g.wall * ds)
 	# Signed optic flow so L/R HS asymmetry can reach SEZ yaw pools.
-	_inject_field(network, ids, ME_HS, _signed_field(flow_h), g.flow)
-	_inject_field(network, ids, ME_VS, _signed_field(flow_v), g.flow)
-	_inject_uniform(network, ids, ME_EXP, 8, expand * g.expand)
-	_inject_uniform(network, ids, ME_EXP + 8, 8, contrast * g.flow * 0.85)
-	_inject_field(network, ids, ME_MISC, mate_f, g.mate * 0.85)
+	_inject_field(network, ids, ME_HS, _signed_field(flow_h), g.flow * ds)
+	_inject_field(network, ids, ME_VS, _signed_field(flow_v), g.flow * ds)
+	_inject_uniform(network, ids, ME_EXP, 8, expand * g.expand * ds)
+	_inject_uniform(network, ids, ME_EXP + 8, 8, contrast * g.flow * 0.85 * ds)
+	_inject_field(network, ids, ME_MISC, mate_f, g.mate * 0.85 * ds)
 
 
 static func _apply_me_gpu(
@@ -132,18 +142,20 @@ static func _apply_me_gpu(
 	contrast: float,
 	g: Gains
 ) -> void:
-	engine.inject_weights(slot, ids, ME_ON, on_f, g.food)
-	engine.inject_weights(slot, ids, ME_OFF, off_f, g.wall)
-	engine.inject_weights(slot, ids, ME_HS, _signed_field(flow_h), g.flow)
-	engine.inject_weights(slot, ids, ME_VS, _signed_field(flow_v), g.flow)
-	engine.inject_range(slot, ids, ME_EXP, 8, expand * g.expand)
-	engine.inject_range(slot, ids, ME_EXP + 8, 8, contrast * g.flow * 0.85)
-	engine.inject_weights(slot, ids, ME_MISC, mate_f, g.mate * 0.85)
+	var ds := g.drive_scale
+	engine.inject_weights(slot, ids, ME_ON, on_f, g.food * ds)
+	engine.inject_weights(slot, ids, ME_OFF, off_f, g.wall * ds)
+	engine.inject_weights(slot, ids, ME_HS, _signed_field(flow_h), g.flow * ds)
+	engine.inject_weights(slot, ids, ME_VS, _signed_field(flow_v), g.flow * ds)
+	engine.inject_range(slot, ids, ME_EXP, 8, expand * g.expand * ds)
+	engine.inject_range(slot, ids, ME_EXP + 8, 8, contrast * g.flow * 0.85 * ds)
+	engine.inject_weights(slot, ids, ME_MISC, mate_f, g.mate * 0.85 * ds)
 
 
 static func _apply_lop(network: NeuralNetwork, ids: PackedInt32Array, packet: SensoryPacket, g: Gains) -> void:
-	_inject_field(network, ids, LOP_ON, packet.median_on, g.food * 1.05)
-	_inject_field(network, ids, LOP_OFF, packet.median_off, g.wall * 1.05)
+	var ds := g.drive_scale
+	_inject_field(network, ids, LOP_ON, packet.median_on, g.food * 1.05 * ds)
+	_inject_field(network, ids, LOP_OFF, packet.median_off, g.wall * 1.05 * ds)
 	var hs := PackedFloat32Array()
 	hs.resize(16)
 	var yaw := packet.flow_yaw
@@ -161,31 +173,39 @@ static func _apply_lop(network: NeuralNetwork, ids: PackedInt32Array, packet: Se
 			+ loom_lr * (0.25 + 0.35 * t)
 			+ food_lr * (0.55 + 0.85 * t)
 		)
-	_inject_field(network, ids, LOP_HS, hs, g.flow * 1.15)
+	_inject_field(network, ids, LOP_HS, hs, g.flow * 1.15 * ds)
 	var vs := PackedFloat32Array()
 	vs.resize(16)
 	var pitch := packet.flow_pitch
 	var food_v := packet.food_up - packet.food_down
+	var alt_v := packet.floor_loom - packet.ceiling_loom
 	for i in 16:
 		var t := (float(i) / 15.0) * 2.0 - 1.0
-		vs[i] = pitch * (0.4 + 0.6 * t) + food_v * (0.35 + 0.4 * t)
-	_inject_field(network, ids, LOP_VS, vs, g.flow)
+		vs[i] = (
+			pitch * (0.4 + 0.6 * t)
+			+ food_v * (0.35 + 0.4 * t)
+			+ alt_v * (0.55 + 0.45 * t)
+		)
+	_inject_field(network, ids, LOP_VS, vs, g.flow * ds)
 	var exp_v := maxf(packet.expand_m, maxf(packet.expand_l, packet.expand_r) * 0.75)
-	_inject_uniform(network, ids, LOP_EXP, 32, exp_v * g.expand)
-	_inject_field(network, ids, LOP_MATE, packet.median_mate, g.mate)
+	# Ground proximity expansion into LOP (altitude collision).
+	exp_v = maxf(exp_v, packet.floor_loom * 1.1)
+	_inject_uniform(network, ids, LOP_EXP, 32, exp_v * g.expand * ds)
+	_inject_field(network, ids, LOP_MATE, packet.median_mate, g.mate * ds)
 	var conflict := (
 		absf(_ch(packet.left_eye, 1) - _ch(packet.right_eye, 1)) * g.conflict
 		+ absf(_ch(packet.left_eye, 0) - _ch(packet.right_eye, 0)) * g.conflict * 1.25
 		+ absf(packet.expand_l - packet.expand_r) * g.conflict
 		+ absf(packet.food_bearing_yaw) * g.conflict * 0.35
 	)
-	_inject_uniform(network, ids, LOP_MISC, 16, conflict + g.tonic * 0.5)
+	_inject_uniform(network, ids, LOP_MISC, 16, (conflict + g.tonic * 0.5) * ds)
 
 
 static func _apply_lop_gpu(engine: GpuLifEngine, slot: int, packet: SensoryPacket, g: Gains) -> void:
 	var ids := engine.map_median
-	engine.inject_weights(slot, ids, LOP_ON, packet.median_on, g.food * 1.05)
-	engine.inject_weights(slot, ids, LOP_OFF, packet.median_off, g.wall * 1.05)
+	var ds := g.drive_scale
+	engine.inject_weights(slot, ids, LOP_ON, packet.median_on, g.food * 1.05 * ds)
+	engine.inject_weights(slot, ids, LOP_OFF, packet.median_off, g.wall * 1.05 * ds)
 	var hs := PackedFloat32Array()
 	hs.resize(16)
 	var yaw := packet.flow_yaw
@@ -201,25 +221,31 @@ static func _apply_lop_gpu(engine: GpuLifEngine, slot: int, packet: SensoryPacke
 			+ loom_lr * (0.25 + 0.35 * t)
 			+ food_lr * (0.55 + 0.85 * t)
 		)
-	engine.inject_weights(slot, ids, LOP_HS, hs, g.flow * 1.15)
+	engine.inject_weights(slot, ids, LOP_HS, hs, g.flow * 1.15 * ds)
 	var vs := PackedFloat32Array()
 	vs.resize(16)
 	var pitch := packet.flow_pitch
 	var food_v := packet.food_up - packet.food_down
+	var alt_v := packet.floor_loom - packet.ceiling_loom
 	for i in 16:
 		var t := (float(i) / 15.0) * 2.0 - 1.0
-		vs[i] = pitch * (0.4 + 0.6 * t) + food_v * (0.35 + 0.4 * t)
-	engine.inject_weights(slot, ids, LOP_VS, vs, g.flow)
+		vs[i] = (
+			pitch * (0.4 + 0.6 * t)
+			+ food_v * (0.35 + 0.4 * t)
+			+ alt_v * (0.55 + 0.45 * t)
+		)
+	engine.inject_weights(slot, ids, LOP_VS, vs, g.flow * ds)
 	var exp_v := maxf(packet.expand_m, maxf(packet.expand_l, packet.expand_r) * 0.75)
-	engine.inject_range(slot, ids, LOP_EXP, 32, exp_v * g.expand)
-	engine.inject_weights(slot, ids, LOP_MATE, packet.median_mate, g.mate)
+	exp_v = maxf(exp_v, packet.floor_loom * 1.1)
+	engine.inject_range(slot, ids, LOP_EXP, 32, exp_v * g.expand * ds)
+	engine.inject_weights(slot, ids, LOP_MATE, packet.median_mate, g.mate * ds)
 	var conflict := (
 		absf(_ch(packet.left_eye, 1) - _ch(packet.right_eye, 1)) * g.conflict
 		+ absf(_ch(packet.left_eye, 0) - _ch(packet.right_eye, 0)) * g.conflict * 1.25
 		+ absf(packet.expand_l - packet.expand_r) * g.conflict
 		+ absf(packet.food_bearing_yaw) * g.conflict * 0.35
 	)
-	engine.inject_range(slot, ids, LOP_MISC, 16, conflict + g.tonic * 0.5)
+	engine.inject_range(slot, ids, LOP_MISC, 16, (conflict + g.tonic * 0.5) * ds)
 
 
 static func _drive_motor_goals_gpu(engine: GpuLifEngine, slot: int, packet: SensoryPacket, g: Gains) -> void:
@@ -233,31 +259,46 @@ static func _drive_motor_goals_gpu(engine: GpuLifEngine, slot: int, packet: Sens
 	var chunk := maxi(1, int(floor(float(mot.size()) / float(channels))))
 	var hunger := clampf(packet.food_motivation / 2.8, 0.0, 1.0)
 	var food_sal := maxf(_ch(packet.median_eye, 1), maxf(_ch(packet.left_eye, 1), _ch(packet.right_eye, 1)))
+	var heading := packet.food_bearing_yaw * (0.7 + 1.0 * packet.food_bearing_strength)
 	var food_lr := (
 		_ch(packet.left_eye, 1) - _ch(packet.right_eye, 1)
-		+ packet.food_bearing_yaw * (0.7 + packet.food_bearing_strength)
+		+ heading
 	)
-	var wall_sal := maxf(packet.expand_m, maxf(_ch(packet.left_eye, 0), _ch(packet.right_eye, 0)))
-	# Forward: food attracts + exploratory tonic. Wall braking stays in the blend layer.
-	var fwd_amp := 0.38 + food_sal * g.food * (0.45 + 0.7 * hunger)
+	# Cruise / brake from FRONTAL loom only — side pillars must not kill advance.
+	var frontal := packet.expand_m
+	var ds := g.drive_scale
+	var clear := clampf(1.0 - frontal, 0.0, 1.0)
+	var fwd_amp := (0.95 + food_sal * g.food * 0.45 + clear * 0.75) * ds
+	if frontal > 0.42:
+		fwd_amp -= frontal * g.wall * 0.65 * ds
+	if frontal > 0.7:
+		fwd_amp -= frontal * g.wall * 0.45 * ds
 	engine.inject_range(slot, mot, 0, chunk, fwd_amp)
-	# Vertical toward food hemisphere.
-	var vert_amp := (packet.food_up - packet.food_down) * g.food * 0.45 * (0.4 + 0.5 * hunger)
+	var food_vert := packet.food_up - packet.food_down
+	var alt_vert := packet.floor_loom - packet.ceiling_loom
+	var vert_amp := food_vert * g.food * 0.45 * (0.4 + 0.5 * hunger) * ds
+	vert_amp += packet.floor_loom * g.wall * 1.05 * ds
+	vert_amp -= packet.ceiling_loom * g.wall * 1.15 * ds
+	if absf(food_vert) < 0.15 and absf(alt_vert) < 0.08:
+		vert_amp += g.depth_pref * 0.35 * ds
 	engine.inject_range(slot, mot, chunk, chunk, vert_amp)
-	# Motor yaw+ = turn left. Map packing [fwd|vert|yaw_L|pitch|yaw_R], yaw=L−R.
-	# Food on left (food_lr>0) must raise yaw → excite yaw_L / quiet yaw_R.
-	var yaw_amp := clampf(food_lr * g.food * (0.28 + 0.35 * hunger), -0.85, 0.85)
-	if absf(yaw_amp) > 0.03:
+	var pitch_amp := (packet.floor_loom * 0.65 - packet.ceiling_loom * 0.75) * g.wall * ds
+	if absf(pitch_amp) > 0.03:
+		engine.inject_range(slot, mot, 3 * chunk, chunk, pitch_amp)
+	# Corridor yaw dominates until hard frontal loom.
+	var yaw_amp := clampf(food_lr * g.food * (0.55 + 0.55 * clear), -1.1, 1.1) * ds
+	if absf(yaw_amp) > 0.02 and frontal < 0.65:
 		engine.inject_range(slot, mot, 2 * chunk, chunk, yaw_amp)
-		engine.inject_range(slot, mot, 4 * chunk, chunk, -yaw_amp * 0.4)
-	# Wall escape into opposite yaw pool (weaker than food when hungry).
+		engine.inject_range(slot, mot, 4 * chunk, chunk, -yaw_amp * 0.35)
+	# Escape turn only on hard frontal loom.
 	var wall_lr := _ch(packet.right_eye, 0) - _ch(packet.left_eye, 0)
-	var wamp := wall_lr * g.wall * (0.28 + 0.2 * (1.0 - hunger))
-	if absf(wamp) > 0.04:
-		engine.inject_range(slot, mot, 2 * chunk, chunk, wamp)
-		engine.inject_range(slot, mot, 4 * chunk, chunk, -wamp * 0.4)
-	if wall_sal > 0.75:
-		engine.inject_range(slot, mot, 0, chunk, -wall_sal * g.wall * 0.2)
+	var flow_escape := packet.flow_yaw
+	if frontal > 0.34:
+		var wamp := (wall_lr * 1.4 + flow_escape * 0.8) * g.wall * (1.0 + 1.2 * frontal) * ds
+		wamp = clampf(wamp, -1.45, 1.45)
+		if absf(wamp) > 0.03:
+			engine.inject_range(slot, mot, 2 * chunk, chunk, wamp)
+			engine.inject_range(slot, mot, 4 * chunk, chunk, -wamp * 0.55)
 
 
 static func _drive_motor_goals_cpu(network: NeuralNetwork, packet: SensoryPacket, g: Gains) -> void:
@@ -268,26 +309,43 @@ static func _drive_motor_goals_cpu(network: NeuralNetwork, packet: SensoryPacket
 	var chunk := maxi(1, int(floor(float(mot.size()) / float(channels))))
 	var hunger := clampf(packet.food_motivation / 2.8, 0.0, 1.0)
 	var food_sal := maxf(_ch(packet.median_eye, 1), maxf(_ch(packet.left_eye, 1), _ch(packet.right_eye, 1)))
+	var heading := packet.food_bearing_yaw * (0.7 + 1.0 * packet.food_bearing_strength)
 	var food_lr := (
 		_ch(packet.left_eye, 1) - _ch(packet.right_eye, 1)
-		+ packet.food_bearing_yaw * (0.7 + packet.food_bearing_strength)
+		+ heading
 	)
-	var wall_sal := maxf(packet.expand_m, maxf(_ch(packet.left_eye, 0), _ch(packet.right_eye, 0)))
-	var fwd_amp := 0.38 + food_sal * g.food * (0.45 + 0.7 * hunger)
+	var frontal := packet.expand_m
+	var ds := g.drive_scale
+	var clear := clampf(1.0 - frontal, 0.0, 1.0)
+	var fwd_amp := (0.95 + food_sal * g.food * 0.45 + clear * 0.75) * ds
+	if frontal > 0.42:
+		fwd_amp -= frontal * g.wall * 0.65 * ds
+	if frontal > 0.7:
+		fwd_amp -= frontal * g.wall * 0.45 * ds
 	_inject_uniform(network, mot, 0, chunk, fwd_amp)
-	var vert_amp := (packet.food_up - packet.food_down) * g.food * 0.45 * (0.4 + 0.5 * hunger)
+	var food_vert := packet.food_up - packet.food_down
+	var alt_vert := packet.floor_loom - packet.ceiling_loom
+	var vert_amp := food_vert * g.food * 0.45 * (0.4 + 0.5 * hunger) * ds
+	vert_amp += packet.floor_loom * g.wall * 1.05 * ds
+	vert_amp -= packet.ceiling_loom * g.wall * 1.15 * ds
+	if absf(food_vert) < 0.15 and absf(alt_vert) < 0.08:
+		vert_amp += g.depth_pref * 0.35 * ds
 	_inject_uniform(network, mot, chunk, chunk, vert_amp)
-	var yaw_amp := clampf(food_lr * g.food * (0.28 + 0.35 * hunger), -0.85, 0.85)
-	if absf(yaw_amp) > 0.03:
+	var pitch_amp := (packet.floor_loom * 0.65 - packet.ceiling_loom * 0.75) * g.wall * ds
+	if absf(pitch_amp) > 0.03:
+		_inject_uniform(network, mot, 3 * chunk, chunk, pitch_amp)
+	var yaw_amp := clampf(food_lr * g.food * (0.55 + 0.55 * clear), -1.1, 1.1) * ds
+	if absf(yaw_amp) > 0.02 and frontal < 0.65:
 		_inject_uniform(network, mot, 2 * chunk, chunk, yaw_amp)
-		_inject_uniform(network, mot, 4 * chunk, chunk, -yaw_amp * 0.4)
+		_inject_uniform(network, mot, 4 * chunk, chunk, -yaw_amp * 0.35)
 	var wall_lr := _ch(packet.right_eye, 0) - _ch(packet.left_eye, 0)
-	var wamp := wall_lr * g.wall * (0.28 + 0.2 * (1.0 - hunger))
-	if absf(wamp) > 0.04:
-		_inject_uniform(network, mot, 2 * chunk, chunk, wamp)
-		_inject_uniform(network, mot, 4 * chunk, chunk, -wamp * 0.4)
-	if wall_sal > 0.75:
-		_inject_uniform(network, mot, 0, chunk, -wall_sal * g.wall * 0.2)
+	var flow_escape := packet.flow_yaw
+	if frontal > 0.34:
+		var wamp := (wall_lr * 1.4 + flow_escape * 0.8) * g.wall * (1.0 + 1.2 * frontal) * ds
+		wamp = clampf(wamp, -1.45, 1.45)
+		if absf(wamp) > 0.03:
+			_inject_uniform(network, mot, 2 * chunk, chunk, wamp)
+			_inject_uniform(network, mot, 4 * chunk, chunk, -wamp * 0.55)
 
 
 static func _inject_field(network: NeuralNetwork, ids: PackedInt32Array, offset: int, field: PackedFloat32Array, gain: float) -> void:

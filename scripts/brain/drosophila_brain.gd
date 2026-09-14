@@ -1,7 +1,7 @@
 class_name DrosophilaBrain
 extends Brain
 ## FlyWire connectome brain — prefers GPU Vulkan LIF+, CPU fallback.
-## Interface layer (sense gains + linear adapter) is evolvable; synapses are not.
+## Interface + body genes evolve always; sparse synapse mults when connectome_evolution_enabled.
 
 var network: NeuralNetwork = NeuralNetwork.new()
 var genome: BrainGenome = BrainGenome.new()
@@ -14,6 +14,10 @@ var use_gpu: bool = false
 var gpu_slot: int = -1
 var _pending_packet: SensoryPacket = SensoryPacket.new()
 var _last_raw: PackedFloat32Array = PackedFloat32Array()
+## Free-flight: pass full SEZ stick without aquarium soft-clamps.
+var _flight_mode: bool = false
+## World-up thrust that counters flight_gravity when attitude is level.
+var _flight_hover: float = 0.0
 
 
 func initialize(config: SimulationConfig, rng: RandomNumberGenerator, genome_in: BrainGenome = null) -> void:
@@ -27,6 +31,12 @@ func initialize(config: SimulationConfig, rng: RandomNumberGenerator, genome_in:
 	_brain_accum = 0.0
 	use_gpu = false
 	gpu_slot = -1
+	_flight_mode = config.is_free_flight()
+	# Solo fly can afford a hotter neural clock (full connectome, 1 agent).
+	brain_dt = 1.0 / 60.0 if _flight_mode else 1.0 / 30.0
+	_flight_hover = 0.0
+	if _flight_mode and config.linear_accel > 0.01:
+		_flight_hover = clampf(config.flight_gravity / config.linear_accel, 0.12, 0.55)
 
 	if genome_in != null:
 		genome = genome_in.duplicate_genome()
@@ -48,24 +58,40 @@ func initialize(config: SimulationConfig, rng: RandomNumberGenerator, genome_in:
 		push_warning("DrosophilaBrain: missing provenance")
 		return
 
+	if config.connectome_evolution_enabled:
+		_ensure_sparse_loci(template, rng, path)
+
+	# Sparse plastic weights need a private CSR copy → CPU path for that agent.
+	var need_cpu_weights := (
+		config.connectome_evolution_enabled and genome != null and genome.has_plastic_synapses()
+	)
+
 	var eng := GpuLifEngine.get_engine()
-	if not eng.ready and not eng.setup_failed:
-		eng.setup(template, config.max_triops)
-	if eng.ready:
-		gpu_slot = eng.allocate_slot()
-		use_gpu = gpu_slot >= 0
+	if not need_cpu_weights:
+		if not eng.ready and not eng.setup_failed:
+			eng.setup(template, config.max_triops)
+		if eng.ready:
+			gpu_slot = eng.allocate_slot()
+			use_gpu = gpu_slot >= 0
 	if not use_gpu:
-		network = template.instantiate()
+		network = template.instantiate(need_cpu_weights)
+		if need_cpu_weights and genome != null:
+			network.apply_sparse_weight_mults(genome.synapse_ids, genome.synapse_mults)
 		# CPU path: coarser neural dt so headless stays interactive.
 		brain_dt = 1.0 / 10.0
 		network.max_active = 400
 		network.max_spike_events = 80
+		var base_drive := 3.2
 		if genome and genome.motor_gains.size() > 0:
-			network.drive_gain = 3.2 + genome.motor_gains[0] * 0.4
+			base_drive = 3.2 + genome.motor_gains[0] * 0.4
+		network.drive_gain = base_drive
+		if genome:
+			network.syn_scale = template.syn_scale * clampf(genome.syn_scale_gene, 0.55, 1.55)
 	_ready = true
 
 
 func _ensure_interface_genes(rng: RandomNumberGenerator) -> void:
+	## Migrate array sizes only — do not clamp evolved gains (selection must see traits).
 	if genome.input_count < 9 or genome.output_count < MotorInterface.CHANNEL_COUNT:
 		genome.setup(9, MotorInterface.CHANNEL_COUNT)
 		genome.randomize_genes(rng, 0.12)
@@ -77,28 +103,34 @@ func _ensure_interface_genes(rng: RandomNumberGenerator) -> void:
 		while sg.size() < 8:
 			sg.append(1.15 if sg.size() == 6 else 1.55)
 		genome.sense_gains = sg
-	if genome.interface_mix < 0.0 or genome.interface_mix > 0.05:
-		genome.interface_mix = 0.0
-	# Legacy taxis genes stay at 0 — motor is SEZ-only.
-	genome.forward_tonic = 0.0
-	genome.chemotaxis = 0.0
-	genome.mate_taxis = 0.0
-	genome.wall_taxis = 0.0
-	genome.wall_brake = 0.0
-	genome.vertical_amp = 0.0
-	genome.pitch_amp = 0.0
-	if genome.sense_gains.size() >= 1 and genome.sense_gains[0] < 1.8:
-		genome.sense_gains[0] = 2.45
-	if genome.motor_gains.size() > MotorInterface.CHANNEL_YAW:
-		genome.motor_gains[MotorInterface.CHANNEL_YAW] = maxf(
-			genome.motor_gains[MotorInterface.CHANNEL_YAW], 1.55
-		)
+	if genome.motor_gains.size() < MotorInterface.CHANNEL_COUNT:
+		var mg := genome.motor_gains.duplicate()
+		while mg.size() < MotorInterface.CHANNEL_COUNT:
+			mg.append(1.0)
+		genome.motor_gains = mg
+
+
+func _ensure_sparse_loci(template: NeuralNetwork, rng: RandomNumberGenerator, path: String) -> void:
+	if genome == null:
+		return
+	if genome.synapse_ids.is_empty():
+		var ids := ConnectomeCache.get_motor_synapse_loci(path, BrainGenome.SPARSE_SYNAPSE_K, rng)
+		if ids.is_empty():
+			ids = template.sample_motor_synapse_ids(BrainGenome.SPARSE_SYNAPSE_K, rng)
+		genome.ensure_sparse_synapses(ids)
+		return
+	if genome.synapse_mults.size() < genome.synapse_ids.size():
+		var old := genome.synapse_mults.duplicate()
+		genome.synapse_mults.resize(genome.synapse_ids.size())
+		for i in genome.synapse_mults.size():
+			genome.synapse_mults[i] = old[i] if i < old.size() else 1.0
 
 
 func prepare_gpu_drive(packet: SensoryPacket) -> void:
 	_pending_packet = packet
 	if not (use_gpu and _ready):
 		return
+	# Soft GPU proxy: fold syn_scale_gene into inject amplitude (shared CSR weights).
 	SensoryMapping.apply_gpu(GpuLifEngine.get_engine(), gpu_slot, packet, genome)
 
 
@@ -151,7 +183,7 @@ func _blend_interface(packet: SensoryPacket, raw: PackedFloat32Array) -> PackedF
 	var out := PackedFloat32Array()
 	out.resize(MotorInterface.CHANNEL_COUNT)
 	var mix := 0.0
-	if genome:
+	if genome and not _flight_mode:
 		mix = clampf(genome.interface_mix, 0.0, 0.05)
 	var flat := packet.as_flat()
 	var in_n := genome.input_count if genome else 9
@@ -166,9 +198,54 @@ func _blend_interface(packet: SensoryPacket, raw: PackedFloat32Array) -> PackedF
 					adapter += genome.weights[row + i] * flat[i]
 			v = brain_v * (1.0 - mix) + tanh(adapter) * mix
 		var gain: float = genome.motor_gains[o] if genome and o < genome.motor_gains.size() else 1.0
-		out[o] = clampf(v * gain, -1.0, 1.0)
-	# Mild roll damping only (body stability), not steering.
-	out[MotorInterface.CHANNEL_ROLL] = clampf(out[MotorInterface.CHANNEL_ROLL] * 0.45, -0.55, 0.55)
+		var scaled := v * gain
+		if _flight_mode:
+			# Full connectome owns the stick — no aquarium soft-clamp on yaw/pitch.
+			out[o] = clampf(scaled, -1.0, 1.0)
+		elif o == MotorInterface.CHANNEL_YAW or o == MotorInterface.CHANNEL_PITCH:
+			out[o] = tanh(scaled * 0.85)
+		else:
+			out[o] = clampf(scaled, -1.0, 1.0)
+	if _flight_mode:
+		# SEZ is the stick. Only center single-ended pools + light altitude assist
+		# from ventral loom already injected into the LIF.
+		var alt := packet.floor_loom - packet.ceiling_loom
+		var raw_v := out[MotorInterface.CHANNEL_VERTICAL]
+		var raw_p := out[MotorInterface.CHANNEL_PITCH]
+		out[MotorInterface.CHANNEL_VERTICAL] = clampf(
+			_flight_hover + (raw_v - 0.42) * 0.85 + alt * 0.35,
+			-1.0,
+			1.0
+		)
+		if packet.floor_loom > 0.85:
+			out[MotorInterface.CHANNEL_VERTICAL] = maxf(
+				out[MotorInterface.CHANNEL_VERTICAL],
+				0.4 + packet.floor_loom * 0.25
+			)
+		out[MotorInterface.CHANNEL_PITCH] = clampf(
+			(raw_p - 0.12) * 0.8 + alt * 0.25,
+			-1.0,
+			1.0
+		)
+		# Roll almost off — body leveling keeps belly down; SEZ yaw steers.
+		out[MotorInterface.CHANNEL_ROLL] = clampf(out[MotorInterface.CHANNEL_ROLL] * 0.12, -0.2, 0.2)
+		# Yaw: lock course when clear; brief dodge only on hard frontal loom.
+		var threat := clampf(packet.expand_m, 0.0, 1.0)
+		var dodge_w := clampf((threat - 0.38) / 0.35, 0.0, 1.0)
+		var yaw_sez := out[MotorInterface.CHANNEL_YAW]
+		var course := clampf(packet.food_bearing_yaw, -0.85, 0.85)
+		out[MotorInterface.CHANNEL_YAW] = clampf(
+			lerpf(course, yaw_sez * 0.25 + packet.flow_yaw * 0.9, dodge_w),
+			-1.0,
+			1.0
+		)
+		out[MotorInterface.CHANNEL_FORWARD] = clampf(
+			lerpf(0.92, maxf(out[MotorInterface.CHANNEL_FORWARD], 0.35), dodge_w),
+			0.15,
+			1.0
+		)
+	else:
+		out[MotorInterface.CHANNEL_ROLL] = clampf(out[MotorInterface.CHANNEL_ROLL] * 0.45, -0.55, 0.55)
 	return out
 
 

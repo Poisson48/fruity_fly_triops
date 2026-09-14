@@ -20,12 +20,12 @@ const CHANNEL_COUNT := 5
 ## Empty = identity mapping for the first CHANNEL_COUNT outputs.
 var channel_map: PackedInt32Array = PackedInt32Array()
 
-## Scales applied after mapping.
+## Scales applied after mapping (yaw soft-saturated in decode).
 var thrust_scale: float = 1.0
-var vertical_scale: float = 1.35
-var yaw_scale: float = 1.55
-var pitch_scale: float = 1.35
-var roll_scale: float = 0.55
+var vertical_scale: float = 0.65
+var yaw_scale: float = 0.7
+var pitch_scale: float = 1.0
+var roll_scale: float = 0.4
 
 
 class MotorCommand:
@@ -41,10 +41,26 @@ func decode(brain_outputs: PackedFloat32Array) -> MotorCommand:
 	var cmd := MotorCommand.new()
 	cmd.forward = _read(brain_outputs, CHANNEL_FORWARD) * thrust_scale
 	cmd.vertical = _read(brain_outputs, CHANNEL_VERTICAL) * vertical_scale
-	cmd.yaw = _read(brain_outputs, CHANNEL_YAW) * yaw_scale
-	cmd.pitch = _read(brain_outputs, CHANNEL_PITCH) * pitch_scale
+	# Soft sat — saturated SEZ still steers, but body YAW_LOCK_CAP stops orbits.
+	cmd.yaw = tanh(_read(brain_outputs, CHANNEL_YAW) * yaw_scale)
+	cmd.pitch = tanh(_read(brain_outputs, CHANNEL_PITCH) * pitch_scale)
 	cmd.roll = _read(brain_outputs, CHANNEL_ROLL) * roll_scale
 	return cmd
+
+
+func configure_for_mode(config: SimulationConfig) -> void:
+	if config != null and config.is_free_flight():
+		thrust_scale = 1.15
+		vertical_scale = 1.1
+		yaw_scale = 1.25
+		pitch_scale = 1.15
+		roll_scale = 0.18
+	else:
+		thrust_scale = 1.0
+		vertical_scale = 0.65
+		yaw_scale = 0.7
+		pitch_scale = 1.0
+		roll_scale = 0.4
 
 
 func _read(outputs: PackedFloat32Array, motor_channel: int) -> float:

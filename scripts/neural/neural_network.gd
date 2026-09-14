@@ -157,13 +157,13 @@ func _init_state_arrays() -> void:
 	active_list = PackedInt32Array()
 
 
-func instantiate() -> NeuralNetwork:
+func instantiate(clone_weights: bool = false) -> NeuralNetwork:
 	var n := NeuralNetwork.new()
 	n.n_neurons = n_neurons
 	n.n_synapses = n_synapses
 	n.csr_offsets = csr_offsets
 	n.csr_targets = csr_targets
-	n.csr_weights = csr_weights
+	n.csr_weights = csr_weights.duplicate() if clone_weights else csr_weights
 	n.csr_sources = csr_sources
 	n.map_left = map_left
 	n.map_right = map_right
@@ -184,6 +184,49 @@ func instantiate() -> NeuralNetwork:
 	n.max_spike_events = max_spike_events
 	n._init_state_arrays()
 	return n
+
+
+func apply_sparse_weight_mults(ids: PackedInt32Array, mults: PackedFloat32Array) -> void:
+	## Mutates this instance's csr_weights (must be a private copy).
+	var n := mini(ids.size(), mults.size())
+	for i in n:
+		var e: int = ids[i]
+		if e < 0 or e >= csr_weights.size():
+			continue
+		csr_weights[e] *= clampf(mults[i], 0.5, 1.5)
+
+
+func sample_motor_synapse_ids(k: int, rng: RandomNumberGenerator) -> PackedInt32Array:
+	## Stable sample of CSR edges touching map_motor neurons.
+	var out := PackedInt32Array()
+	if k <= 0 or n_synapses <= 0 or map_motor.is_empty():
+		return out
+	var motor := {}
+	for ni in map_motor:
+		if ni >= 0:
+			motor[ni] = true
+	var candidates := PackedInt32Array()
+	var has_src := csr_sources.size() == n_synapses
+	for e in n_synapses:
+		var tgt: int = csr_targets[e] if e < csr_targets.size() else -1
+		var src: int = csr_sources[e] if has_src else -1
+		if motor.has(tgt) or motor.has(src):
+			candidates.append(e)
+	if candidates.is_empty():
+		# Fallback: uniform sample over all synapses.
+		for _i in mini(k, n_synapses):
+			out.append(rng.randi_range(0, n_synapses - 1))
+		return out
+	# Fisher-Yates partial shuffle for unique sample.
+	var n_cand := candidates.size()
+	var take := mini(k, n_cand)
+	for i in take:
+		var j := rng.randi_range(i, n_cand - 1)
+		var tmp := candidates[i]
+		candidates[i] = candidates[j]
+		candidates[j] = tmp
+		out.append(candidates[i])
+	return out
 
 
 func _activate(i: int) -> void:

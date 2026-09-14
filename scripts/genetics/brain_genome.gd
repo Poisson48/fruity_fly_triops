@@ -1,7 +1,10 @@
 class_name BrainGenome
 extends RefCounted
-## Heritable INTERFACE parameters (V4+).
-## FlyWire synapse topology stays fixed; these genes tune Triops↔brain coupling.
+## Heritable INTERFACE + body + optional sparse connectome deltas (V4–C).
+## FlyWire synapse *topology* stays fixed; genes tune coupling, body, and sparse weight mults.
+
+const SENSE_GAIN_COUNT := 8
+const SPARSE_SYNAPSE_K := 64
 
 var input_count: int = 0
 var output_count: int = 0
@@ -16,18 +19,21 @@ var motor_gains: PackedFloat32Array = PackedFloat32Array()
 var sense_gains: PackedFloat32Array = PackedFloat32Array()
 ## How much the linear adapter blends with connectome motor readout (0=brain only).
 var interface_mix: float = 0.0
-## Soft forward tonic (legacy gene; exploration now via SEZ motor inject).
-var forward_tonic: float = 0.0
-## Legacy interface taxis genes — unused for motor (connectome pilots).
-var chemotaxis: float = 0.0
-var mate_taxis: float = 0.0
-var wall_taxis: float = 0.0
-var wall_brake: float = 0.0
-## Vertical/pitch amp legacy — unused for motor.
-var vertical_amp: float = 0.0
-var pitch_amp: float = 0.0
-## Soft preferred depth only when no vertical goal is present.
+## Soft preferred depth only when no strong vertical food goal is present.
 var depth_pref: float = 0.0
+
+## Phase B — morpho / metabolism.
+var body_scale: float = 1.0
+var energy_drain_mult: float = 1.0
+var swim_cost_mult: float = 1.0
+var eat_radius_mult: float = 1.0
+var maturity_age_mult: float = 1.0
+
+## Phase C — LIF scalars + sparse SEZ-path weight multipliers.
+var syn_scale_gene: float = 1.0
+var drive_gain_gene: float = 1.0
+var synapse_ids: PackedInt32Array = PackedInt32Array()
+var synapse_mults: PackedFloat32Array = PackedFloat32Array()
 
 
 func setup(in_n: int, out_n: int) -> void:
@@ -38,23 +44,24 @@ func setup(in_n: int, out_n: int) -> void:
 	motor_gains.resize(out_n)
 	for i in motor_gains.size():
 		motor_gains[i] = 1.0
-	# Boost vertical + pitch motor gains by default.
 	if out_n > MotorInterface.CHANNEL_VERTICAL:
 		motor_gains[MotorInterface.CHANNEL_VERTICAL] = 1.35
 	if out_n > MotorInterface.CHANNEL_PITCH:
 		motor_gains[MotorInterface.CHANNEL_PITCH] = 1.25
+	if out_n > MotorInterface.CHANNEL_YAW:
+		motor_gains[MotorInterface.CHANNEL_YAW] = 1.35
 	sense_gains = PackedFloat32Array([2.45, 2.2, 0.65, 0.04, 0.55, 1.2, 1.25, 1.45])
 	interface_mix = 0.0
-	forward_tonic = 0.0
-	chemotaxis = 0.0
-	mate_taxis = 0.0
-	wall_taxis = 0.0
-	wall_brake = 0.0
-	vertical_amp = 0.0
-	pitch_amp = 0.0
 	depth_pref = 0.0
-	if out_n > MotorInterface.CHANNEL_YAW:
-		motor_gains[MotorInterface.CHANNEL_YAW] = 1.65
+	body_scale = 1.0
+	energy_drain_mult = 1.0
+	swim_cost_mult = 1.0
+	eat_radius_mult = 1.0
+	maturity_age_mult = 1.0
+	syn_scale_gene = 1.0
+	drive_gain_gene = 1.0
+	synapse_ids = PackedInt32Array()
+	synapse_mults = PackedFloat32Array()
 
 
 func randomize_genes(rng: RandomNumberGenerator, weight_scale: float = 0.35) -> void:
@@ -82,15 +89,15 @@ func randomize_genes(rng: RandomNumberGenerator, weight_scale: float = 0.35) -> 
 		rng.randf_range(1.1, 1.75),
 	])
 	interface_mix = rng.randf_range(0.0, 0.03)
-	forward_tonic = 0.0
-	chemotaxis = 0.0
-	mate_taxis = 0.0
-	wall_taxis = 0.0
-	wall_brake = 0.0
-	vertical_amp = 0.0
-	pitch_amp = 0.0
 	depth_pref = rng.randf_range(-0.25, 0.25)
-	# Soft evolvable priors (weak — connectome should carry the load):
+	body_scale = rng.randf_range(0.9, 1.1)
+	energy_drain_mult = rng.randf_range(0.9, 1.1)
+	swim_cost_mult = rng.randf_range(0.9, 1.1)
+	eat_radius_mult = rng.randf_range(0.9, 1.1)
+	maturity_age_mult = rng.randf_range(0.9, 1.1)
+	syn_scale_gene = rng.randf_range(0.9, 1.1)
+	drive_gain_gene = rng.randf_range(0.9, 1.1)
+	# Soft evolvable priors for TestBrain adapter (weak when mix≈0 on drosophila):
 	if input_count >= 9 and output_count >= 4:
 		_nudge(0, 1, rng.randf_range(0.15, 0.4))
 		_nudge(0, 4, rng.randf_range(0.15, 0.4))
@@ -114,6 +121,24 @@ func _nudge(out_i: int, in_i: int, delta: float) -> void:
 		weights[idx] = clampf(weights[idx] + delta, -2.0, 2.0)
 
 
+func has_plastic_synapses() -> bool:
+	if synapse_ids.is_empty() or synapse_mults.is_empty():
+		return false
+	var n := mini(synapse_ids.size(), synapse_mults.size())
+	for i in n:
+		if absf(synapse_mults[i] - 1.0) > 0.02:
+			return true
+	return false
+
+
+func ensure_sparse_synapses(ids: PackedInt32Array) -> void:
+	## Assign stable CSR loci (from motor-path sampling). Mults default to 1.
+	synapse_ids = ids.duplicate()
+	synapse_mults.resize(synapse_ids.size())
+	for i in synapse_mults.size():
+		synapse_mults[i] = 1.0
+
+
 func duplicate_genome() -> BrainGenome:
 	var g := BrainGenome.new()
 	g.setup(input_count, output_count)
@@ -124,26 +149,35 @@ func duplicate_genome() -> BrainGenome:
 	g.motor_gains = motor_gains.duplicate()
 	g.sense_gains = sense_gains.duplicate()
 	g.interface_mix = interface_mix
-	g.forward_tonic = forward_tonic
-	g.chemotaxis = chemotaxis
-	g.mate_taxis = mate_taxis
-	g.wall_taxis = wall_taxis
-	g.wall_brake = wall_brake
-	g.vertical_amp = vertical_amp
-	g.pitch_amp = pitch_amp
 	g.depth_pref = depth_pref
+	g.body_scale = body_scale
+	g.energy_drain_mult = energy_drain_mult
+	g.swim_cost_mult = swim_cost_mult
+	g.eat_radius_mult = eat_radius_mult
+	g.maturity_age_mult = maturity_age_mult
+	g.syn_scale_gene = syn_scale_gene
+	g.drive_gain_gene = drive_gain_gene
+	g.synapse_ids = synapse_ids.duplicate()
+	g.synapse_mults = synapse_mults.duplicate()
 	return g
 
 
-func mutate(rng: RandomNumberGenerator, rate: float, scale: float) -> void:
-	for i in weights.size():
+func mutate(
+	rng: RandomNumberGenerator,
+	rate: float,
+	scale: float,
+	mutate_adapter: bool = true,
+	mutate_connectome: bool = false
+) -> void:
+	if mutate_adapter:
+		for i in weights.size():
+			if rng.randf() < rate:
+				weights[i] = clampf(weights[i] + rng.randf_range(-scale, scale), -2.0, 2.0)
+		for i in bias.size():
+			if rng.randf() < rate:
+				bias[i] = clampf(bias[i] + rng.randf_range(-scale, scale), -1.5, 1.5)
 		if rng.randf() < rate:
-			weights[i] = clampf(weights[i] + rng.randf_range(-scale, scale), -2.0, 2.0)
-	for i in bias.size():
-		if rng.randf() < rate:
-			bias[i] = clampf(bias[i] + rng.randf_range(-scale, scale), -1.5, 1.5)
-	if rng.randf() < rate:
-		phase_rate = clampf(phase_rate + rng.randf_range(-scale, scale), 0.2, 3.0)
+			phase_rate = clampf(phase_rate + rng.randf_range(-scale, scale), 0.2, 3.0)
 	for i in motor_gains.size():
 		if rng.randf() < rate:
 			motor_gains[i] = clampf(motor_gains[i] + rng.randf_range(-scale, scale), 0.2, 2.5)
@@ -151,17 +185,36 @@ func mutate(rng: RandomNumberGenerator, rate: float, scale: float) -> void:
 		if rng.randf() < rate:
 			sense_gains[i] = clampf(sense_gains[i] + rng.randf_range(-scale, scale), 0.01, 2.8)
 	if rng.randf() < rate:
-		interface_mix = clampf(interface_mix + rng.randf_range(-scale, scale), 0.0, 0.08)
-	# Taxis genes retired from motor path — keep at zero.
-	forward_tonic = 0.0
-	chemotaxis = 0.0
-	mate_taxis = 0.0
-	wall_taxis = 0.0
-	wall_brake = 0.0
-	vertical_amp = 0.0
-	pitch_amp = 0.0
+		interface_mix = clampf(interface_mix + rng.randf_range(-scale * 0.5, scale * 0.5), 0.0, 0.08)
 	if rng.randf() < rate:
 		depth_pref = clampf(depth_pref + rng.randf_range(-scale, scale), -0.8, 0.8)
+	if rng.randf() < rate:
+		body_scale = clampf(body_scale + rng.randf_range(-scale * 0.5, scale * 0.5), 0.75, 1.35)
+	if rng.randf() < rate:
+		energy_drain_mult = clampf(energy_drain_mult + rng.randf_range(-scale * 0.5, scale * 0.5), 0.6, 1.5)
+	if rng.randf() < rate:
+		swim_cost_mult = clampf(swim_cost_mult + rng.randf_range(-scale * 0.5, scale * 0.5), 0.6, 1.5)
+	if rng.randf() < rate:
+		eat_radius_mult = clampf(eat_radius_mult + rng.randf_range(-scale * 0.5, scale * 0.5), 0.7, 1.4)
+	if rng.randf() < rate:
+		maturity_age_mult = clampf(maturity_age_mult + rng.randf_range(-scale * 0.5, scale * 0.5), 0.7, 1.4)
+	if rng.randf() < rate:
+		syn_scale_gene = clampf(syn_scale_gene + rng.randf_range(-scale * 0.4, scale * 0.4), 0.55, 1.55)
+	if rng.randf() < rate:
+		drive_gain_gene = clampf(drive_gain_gene + rng.randf_range(-scale * 0.4, scale * 0.4), 0.55, 1.55)
+	if mutate_connectome and not synapse_mults.is_empty():
+		for i in synapse_mults.size():
+			if rng.randf() < rate:
+				synapse_mults[i] = clampf(
+					synapse_mults[i] + rng.randf_range(-scale * 0.6, scale * 0.6), 0.5, 1.5
+				)
+		# Rare locus retarget within existing id list (swap with another slot's id).
+		if synapse_ids.size() >= 2 and rng.randf() < rate * 0.25:
+			var a := rng.randi_range(0, synapse_ids.size() - 1)
+			var b := rng.randi_range(0, synapse_ids.size() - 1)
+			var tmp := synapse_ids[a]
+			synapse_ids[a] = synapse_ids[b]
+			synapse_ids[b] = tmp
 	generation += 1
 
 
@@ -183,13 +236,18 @@ static func crossover(a: BrainGenome, b: BrainGenome, rng: RandomNumberGenerator
 		if i < b.sense_gains.size() and rng.randf() < 0.5:
 			child.sense_gains[i] = b.sense_gains[i]
 	child.interface_mix = a.interface_mix if rng.randf() < 0.5 else b.interface_mix
-	child.forward_tonic = a.forward_tonic if rng.randf() < 0.5 else b.forward_tonic
-	child.chemotaxis = a.chemotaxis if rng.randf() < 0.5 else b.chemotaxis
-	child.mate_taxis = a.mate_taxis if rng.randf() < 0.5 else b.mate_taxis
-	child.wall_taxis = a.wall_taxis if rng.randf() < 0.5 else b.wall_taxis
-	child.wall_brake = a.wall_brake if rng.randf() < 0.5 else b.wall_brake
-	child.vertical_amp = a.vertical_amp if rng.randf() < 0.5 else b.vertical_amp
-	child.pitch_amp = a.pitch_amp if rng.randf() < 0.5 else b.pitch_amp
 	child.depth_pref = a.depth_pref if rng.randf() < 0.5 else b.depth_pref
+	child.body_scale = a.body_scale if rng.randf() < 0.5 else b.body_scale
+	child.energy_drain_mult = a.energy_drain_mult if rng.randf() < 0.5 else b.energy_drain_mult
+	child.swim_cost_mult = a.swim_cost_mult if rng.randf() < 0.5 else b.swim_cost_mult
+	child.eat_radius_mult = a.eat_radius_mult if rng.randf() < 0.5 else b.eat_radius_mult
+	child.maturity_age_mult = a.maturity_age_mult if rng.randf() < 0.5 else b.maturity_age_mult
+	child.syn_scale_gene = a.syn_scale_gene if rng.randf() < 0.5 else b.syn_scale_gene
+	child.drive_gain_gene = a.drive_gain_gene if rng.randf() < 0.5 else b.drive_gain_gene
+	# Sparse loci: prefer parent A ids (stable map); crossover mults per locus.
+	var n_syn := mini(child.synapse_mults.size(), b.synapse_mults.size())
+	for i in n_syn:
+		if rng.randf() < 0.5:
+			child.synapse_mults[i] = b.synapse_mults[i]
 	child.generation = maxi(a.generation, b.generation) + 1
 	return child

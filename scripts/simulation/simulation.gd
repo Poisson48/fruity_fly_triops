@@ -16,15 +16,22 @@ var _gpu_brain_accum: float = 0.0
 var gpu_brain_dt: float = 1.0 / 12.0 ## 12 Hz neural at 1× wall-clock
 ## User time acceleration — brain interval scales so GPU cost stays ~constant in wall time.
 var speed_scale: float = 1.0
+var fps_ema: float = 60.0
 var _brains_this_frame: int = 0
 const MAX_BRAINS_PER_FRAME := 1
+## Threads help at mid/high agent counts; overhead hurts Easy (N≈12).
+const THREAD_AGENT_THRESHOLD := 20
+var _wall_urgency_tick: int = 0
 ## Multithread scratch (group tasks).
 var _mt_delta: float = 0.0
 var _mt_do_brain: bool = false
 var _mt_mate_lists: Array = []
 var _mt_packets: Array = []
 var _mt_need_mates: bool = false
+var _mt_nudge_walls: bool = false
 var _use_threads: bool = true
+var _nudge_tick: int = 0
+var void_space: ProceduralVoid = ProceduralVoid.new()
 
 
 func initialize(cfg: SimulationConfig) -> void:
@@ -49,7 +56,13 @@ func initialize(cfg: SimulationConfig) -> void:
 			eng.setup(template, cfg.max_triops)
 
 	for _i in cfg.triops_count:
-		_spawn_agent(null, null, null, 0)
+		var spawn: Variant = Vector3(0.0, 4.0, 0.0) if cfg.is_free_flight() else null
+		_spawn_agent(null, spawn, null, 0)
+	if cfg.is_free_flight() and not agents.is_empty():
+		var start: Vector3 = agents[0].body.position
+		void_space.initialize(cfg.seed, start)
+		food.sync_landmarks(void_space.positions)
+		selected_id = agents[0].id
 
 
 func _create_brain(brain_type: String) -> Brain:
@@ -72,6 +85,7 @@ func _spawn_agent(
 	var brain := _create_brain(config.brain_type)
 	var sex_i: int = int(forced_sex) if typeof(forced_sex) == TYPE_INT else -1
 	agent.setup(_next_id, config, rng, brain, genome, pos, gen, sex_i)
+	agent.motor.configure_for_mode(config)
 	_next_id += 1
 	agents.append(agent)
 	stats.births += 1
@@ -86,17 +100,28 @@ func begin_frame() -> void:
 
 
 func step(delta: float) -> void:
-	food.step(delta, config, rng)
+	var free := config.is_free_flight()
+	if free and not agents.is_empty():
+		var lead: TriopsAgent = agents[0]
+		if lead != null and lead.alive:
+			void_space.step(lead.body.position)
+			food.sync_landmarks(void_space.positions)
+			# Immortal solo fly.
+			lead.alive = true
+			lead.energy = 1.5
+			lead.health = 1.0
+	elif not free:
+		food.step(delta, config, rng)
 	food.prepare_queries()
 
 	var gpu := GpuLifEngine.get_engine()
 	var use_gpu_batch := config.brain_type == "drosophila" and gpu.ready and gpu.agent_count > 0
 	var n := agents.size()
-	var threaded := _use_threads and n >= 4
+	var threaded := (not free) and _use_threads and n >= THREAD_AGENT_THRESHOLD
 
 	# Mate lists only when a full vision/brain tick may need them (or CPU path).
-	_mt_need_mates = not use_gpu_batch
-	if use_gpu_batch:
+	_mt_need_mates = (not free) and (not use_gpu_batch)
+	if use_gpu_batch and not free:
 		var interval_guess := gpu_brain_dt * maxf(1.0, speed_scale)
 		_mt_need_mates = (_gpu_brain_accum + delta) >= interval_guess * 0.45
 
@@ -122,13 +147,33 @@ func step(delta: float) -> void:
 			if not agent.alive:
 				stats.record_death(agent.age_days(config))
 
-	_process_mating()
-	_process_eggs(delta)
-	_remove_dead()
+	if not free:
+		_process_mating()
+		_process_eggs(delta)
+		_remove_dead()
 	_ensure_selection()
 
 	time += delta
 	step_count += 1
+	# Trait telemetry ~1 Hz sim time.
+	if step_count % maxi(1, int(round(1.0 / maxf(config.simulation_dt, 0.001)))) == 0:
+		stats.sample_population(agents)
+
+
+func _eat_radius_for(agent: TriopsAgent) -> float:
+	var eat_m := agent.genome.eat_radius_mult if agent.genome else 1.0
+	return config.eat_radius * agent.scale * eat_m
+
+
+func _apply_metabolism(agent: TriopsAgent, delta: float) -> void:
+	if config.is_free_flight():
+		agent.energy = 1.5
+		agent.health = 1.0
+		return
+	var drain_m := agent.genome.energy_drain_mult if agent.genome else 1.0
+	var swim_m := agent.genome.swim_cost_mult if agent.genome else 1.0
+	var move_cost: float = agent.body.velocity.length() * config.swim_energy_cost * swim_m * delta
+	agent.energy -= config.energy_drain_per_second * drain_m * delta + move_cost
 
 
 func _mt_build_mates(i: int) -> void:
@@ -157,7 +202,7 @@ func _step_agents_cpu_mt(delta: float, mate_lists: Array) -> void:
 		var agent: TriopsAgent = agents[i]
 		if not agent.alive:
 			continue
-		var gained := food.try_eat(agent.body.position, config.eat_radius * agent.scale, config)
+		var gained := food.try_eat(agent.body.position, _eat_radius_for(agent), config)
 		agent.last_ate = gained > 0.0
 		if agent.last_ate:
 			agent.energy = minf(1.5, agent.energy + gained)
@@ -182,6 +227,7 @@ func _mt_cpu_agent_body(i: int) -> void:
 	agent.age += delta
 	agent.mating_cooldown = maxf(0.0, agent.mating_cooldown - delta)
 	agent._update_scale(config)
+	agent.sensors.apply_config(config)
 	var sensory := agent.sensors.sense(
 		agent.body.position,
 		agent.body.orientation,
@@ -191,47 +237,82 @@ func _mt_cpu_agent_body(i: int) -> void:
 		_mt_mate_lists[i],
 		config.mate_sense_radius,
 		agent.body.velocity,
-		config.food_sense_radius
+		config.food_sense_radius,
+		agent.scale
 	)
 	sensory.apply_energy_motivation(agent.energy)
 	agent.sensors.last_packet = sensory
 	var outputs := agent.brain.step(sensory, delta)
 	var cmd := agent.motor.decode(outputs)
 	agent.body.apply_motor(cmd, config, delta)
-	var move_cost: float = agent.body.velocity.length() * config.swim_energy_cost * delta
-	agent.energy -= config.energy_drain_per_second * delta + move_cost
-
+	_post_body(agent)
+	_apply_metabolism(agent, delta)
 
 func _step_agents_gpu(delta: float, mate_lists: Array, gpu: GpuLifEngine, threaded: bool = false) -> void:
-	# Walls every physics frame (cheap); full vision + GPU brain on interval.
+	# Walls every few physics frames (cheap); full vision + GPU brain on interval.
 	# speed_scale stretches the neural interval so 8×/16× doesn't multiply Vulkan syncs.
 	_gpu_brain_accum += delta
+	_wall_urgency_tick = (_wall_urgency_tick + 1) % 2
 	var wall_alert := false
 	var food_alert := false
-	for i in agents.size():
-		var agent: TriopsAgent = agents[i]
-		if not agent.alive:
-			continue
-		if agent.sensors.wall_urgency_fast(
-			agent.body.position,
-			agent.body.orientation,
-			config.aquarium_half_extents,
-			config.eye_ray_length,
-			agent.body.velocity
-		) > 0.5:
-			wall_alert = true
-		var lp: SensoryPacket = agent.sensors.last_packet
-		if lp != null and lp.food_bearing_strength > 0.35:
-			food_alert = true
-		if wall_alert and food_alert:
-			break
+	if _wall_urgency_tick == 0:
+		for i in agents.size():
+			var agent: TriopsAgent = agents[i]
+			if not agent.alive:
+				continue
+			if config.is_free_flight():
+				var h: float = agent.body.position.y
+				var pref: float = config.flight_preferred_altitude
+				var band: float = config.flight_altitude_band
+				if h < pref - band * 0.55 or h > pref + band * 0.85:
+					wall_alert = true
+				var lp0: SensoryPacket = agent.sensors.last_packet
+				if lp0 != null:
+					if maxf(lp0.floor_loom, lp0.ceiling_loom) > 0.45:
+						wall_alert = true
+					if maxf(lp0.expand_m, maxf(_ch_pkt(lp0.left_eye, 0), _ch_pkt(lp0.right_eye, 0))) > 0.22:
+						wall_alert = true
+			elif agent.sensors.wall_urgency_fast(
+				agent.body.position,
+				agent.body.orientation,
+				config.aquarium_half_extents,
+				config.eye_ray_length,
+				agent.body.velocity
+			) > 0.5:
+				wall_alert = true
+			var lp: SensoryPacket = agent.sensors.last_packet
+			if lp != null and lp.food_bearing_strength > 0.35:
+				food_alert = true
+			if wall_alert and food_alert:
+				break
+	else:
+		# Reuse last alerts lightly — prefer food from packets without 5-ray scan.
+		for i in agents.size():
+			var agent: TriopsAgent = agents[i]
+			if not agent.alive:
+				continue
+			var lp: SensoryPacket = agent.sensors.last_packet
+			if lp != null:
+				if config.is_free_flight():
+					if maxf(lp.floor_loom, lp.ceiling_loom) > 0.45 or lp.expand_m > 0.5:
+						wall_alert = true
+				elif lp.expand_m > 0.5:
+					wall_alert = true
+				if lp.food_bearing_strength > 0.35:
+					food_alert = true
+			if wall_alert and food_alert:
+				break
 
 	var interval := gpu_brain_dt * maxf(1.0, speed_scale)
+	# Mild alert boost — aggressive 0.55× doubled Vulkan syncs and killed FPS.
 	if wall_alert:
-		interval *= 0.55
+		interval *= 0.8
 	elif food_alert:
-		interval *= 0.7  # Think faster when food is in view — fly-like.
-	var do_brain := _gpu_brain_accum >= interval and _brains_this_frame < MAX_BRAINS_PER_FRAME
+		interval *= 0.9
+	# Solo free-flight: SEZ every physics tick so loom → dodge stays sharp.
+	var do_brain := true if config.is_free_flight() else (
+		_gpu_brain_accum >= interval and _brains_this_frame < MAX_BRAINS_PER_FRAME
+	)
 	if do_brain:
 		_gpu_brain_accum = 0.0
 		_brains_this_frame += 1
@@ -241,6 +322,9 @@ func _step_agents_gpu(delta: float, mate_lists: Array, gpu: GpuLifEngine, thread
 	_mt_mate_lists = mate_lists
 	_mt_packets = []
 	_mt_packets.resize(agents.size())
+	# Cheap wall nudge only every other physics step when not running a brain tick.
+	_nudge_tick = (_nudge_tick + 1) % 2
+	_mt_nudge_walls = do_brain or _nudge_tick == 0
 
 	if threaded:
 		var gid := WorkerThreadPool.add_group_task(_mt_gpu_sense, agents.size(), -1, true, "sense")
@@ -255,15 +339,21 @@ func _step_agents_gpu(delta: float, mate_lists: Array, gpu: GpuLifEngine, thread
 			if not agent.alive or _mt_packets[i] == null:
 				continue
 			var db := agent.brain as DrosophilaBrain
-			if db:
+			if db == null:
+				continue
+			if db.use_gpu:
 				db.prepare_gpu_drive(_mt_packets[i])
-		gpu.step(interval)
+			else:
+				# Plastic / CPU-fallback agent inside a GPU world.
+				db.step(_mt_packets[i], interval)
+		if gpu.agent_count > 0:
+			gpu.step(interval)
 		for i in agents.size():
 			var agent: TriopsAgent = agents[i]
 			if not agent.alive:
 				continue
 			var db := agent.brain as DrosophilaBrain
-			if db:
+			if db and db.use_gpu:
 				db.fetch_gpu_outputs()
 	else:
 		if threaded:
@@ -281,11 +371,21 @@ func _step_agents_gpu(delta: float, mate_lists: Array, gpu: GpuLifEngine, thread
 			_mt_gpu_body(i)
 
 	# Serial food mutation + death bookkeeping.
+	if config.is_free_flight():
+		for i in agents.size():
+			var agent: TriopsAgent = agents[i]
+			if agent == null:
+				continue
+			agent.alive = true
+			agent.energy = 1.5
+			agent.health = 1.0
+			agent.last_ate = false
+		return
 	for i in agents.size():
 		var agent: TriopsAgent = agents[i]
 		if not agent.alive:
 			continue
-		var gained := food.try_eat(agent.body.position, config.eat_radius * agent.scale, config)
+		var gained := food.try_eat(agent.body.position, _eat_radius_for(agent), config)
 		agent.last_ate = gained > 0.0
 		if agent.last_ate:
 			agent.energy = minf(1.5, agent.energy + gained)
@@ -311,25 +411,73 @@ func _mt_gpu_sense(i: int) -> void:
 	agent.mating_cooldown = maxf(0.0, agent.mating_cooldown - delta)
 	agent._update_scale(config)
 	var sensory: SensoryPacket
+	var half := config.aquarium_half_extents
+	if config.is_free_flight():
+		half = Vector3(1.0e6, 1.0e6, 1.0e6)
 	if _mt_do_brain:
+		agent.sensors.apply_config(config)
 		sensory = agent.sensors.sense(
 			agent.body.position,
 			agent.body.orientation,
-			config.aquarium_half_extents,
+			half,
 			config.eye_ray_length,
 			food,
 			_mt_mate_lists[i],
 			config.mate_sense_radius,
 			agent.body.velocity,
-			config.food_sense_radius
+			config.food_sense_radius,
+			agent.scale
 		)
+		if config.is_free_flight():
+			# Landmark ON is for weak optic texture only — obstacles own loom.
+			sensory.expand_l *= 0.2
+			sensory.expand_r *= 0.2
+			sensory.expand_m *= 0.2
+			agent.sensors.apply_obstacles(
+				sensory,
+				agent.body.position,
+				agent.body.orientation,
+				agent.body.velocity,
+				void_space,
+				config.eye_ray_length,
+				agent.scale
+			)
+			agent.sensors.apply_flight_altitude(
+				sensory,
+				agent.body.position,
+				agent.body.velocity,
+				config.flight_preferred_altitude,
+				config.flight_altitude_band,
+				config.eye_ray_length
+			)
+			agent.sensors.apply_corridor_goal(sensory, agent.body.orientation, void_space)
 		sensory.apply_energy_motivation(agent.energy)
 		agent.sensors.last_packet = sensory
 	else:
 		sensory = agent.sensors.last_packet
 		if sensory == null:
 			sensory = SensoryPacket.new()
-		_nudge_wall_scalars(agent, sensory)
+		if config.is_free_flight():
+			agent.sensors.apply_obstacles(
+				sensory,
+				agent.body.position,
+				agent.body.orientation,
+				agent.body.velocity,
+				void_space,
+				config.eye_ray_length,
+				agent.scale
+			)
+			agent.sensors.apply_flight_altitude(
+				sensory,
+				agent.body.position,
+				agent.body.velocity,
+				config.flight_preferred_altitude,
+				config.flight_altitude_band,
+				config.eye_ray_length
+			)
+			agent.sensors.apply_corridor_goal(sensory, agent.body.orientation, void_space)
+		elif _mt_nudge_walls:
+			_nudge_wall_scalars(agent, sensory)
 	_mt_packets[i] = sensory
 
 
@@ -351,19 +499,29 @@ func _mt_gpu_body(i: int) -> void:
 	var outputs := db.get_outputs() if db else agent.brain.get_outputs()
 	var cmd := agent.motor.decode(outputs)
 	agent.body.apply_motor(cmd, config, delta)
-	var move_cost: float = agent.body.velocity.length() * config.swim_energy_cost * delta
-	agent.energy -= config.energy_drain_per_second * delta + move_cost
+	_post_body(agent)
+	_apply_metabolism(agent, delta)
+
+
+func _post_body(agent: TriopsAgent) -> void:
+	if config != null and config.is_free_flight():
+		agent.body.collide_void_obstacles(void_space)
+
+
+func _ch_pkt(eye: PackedFloat32Array, i: int) -> float:
+	return eye[i] if i < eye.size() else 0.0
 
 
 func _nudge_wall_scalars(agent: TriopsAgent, sensory: SensoryPacket) -> void:
-	## Keep assist taxis roughly current without rebuilding 80-facet mosaics.
-	var u := agent.sensors.wall_urgency_fast(
-		agent.body.position,
-		agent.body.orientation,
-		config.aquarium_half_extents,
-		config.eye_ray_length,
-		agent.body.velocity
+	## AABB proximity only — full 5-ray urgency every physics step was a FPS killer.
+	var half := config.aquarium_half_extents
+	var m := config.wall_margin
+	var p := agent.body.position
+	var d_wall := minf(
+		minf(half.x - m - absf(p.x), half.z - m - absf(p.z)),
+		half.y - m - absf(p.y)
 	)
+	var u := clampf(1.0 - d_wall / maxf(config.eye_ray_length * 0.35, 1.0), 0.0, 1.0)
 	sensory.expand_m = maxf(sensory.expand_m * 0.85, u)
 	sensory.expand_l = maxf(sensory.expand_l * 0.85, u * 0.7)
 	sensory.expand_r = maxf(sensory.expand_r * 0.85, u * 0.7)
@@ -373,14 +531,10 @@ func _nudge_wall_scalars(agent: TriopsAgent, sensory: SensoryPacket) -> void:
 		sensory.left_eye[0] = maxf(sensory.left_eye[0] * 0.85, u * 0.65)
 	if sensory.right_eye.size() >= 1:
 		sensory.right_eye[0] = maxf(sensory.right_eye[0] * 0.85, u * 0.65)
-	sensory.floor_loom = agent.sensors.axis_loom(
-		agent.body.position, Vector3.DOWN, config.aquarium_half_extents, config.eye_ray_length, agent.body.velocity
-	)
-	sensory.ceiling_loom = agent.sensors.axis_loom(
-		agent.body.position, Vector3.UP, config.aquarium_half_extents, config.eye_ray_length, agent.body.velocity
-	)
+	sensory.floor_loom = clampf(1.0 - (p.y + half.y - m) / 3.0, 0.0, 1.0)
+	sensory.ceiling_loom = clampf(1.0 - (half.y - m - p.y) / 3.0, 0.0, 1.0)
 	# Refresh nearest-food bearing cheaply so yaw stays purposeful between brain ticks.
-	if food != null:
+	if food != null and u < 0.85:
 		var near := food.nearby_indices(agent.body.position, config.food_sense_radius)
 		var bear: Vector2 = agent.sensors._nearest_bearing(
 			agent.body.position, agent.body.orientation, food, near, config.food_sense_radius
@@ -422,7 +576,25 @@ func _lay_egg(female: TriopsAgent, male: TriopsAgent) -> void:
 		child_genome = BrainGenome.crossover(ga, gb, rng)
 	else:
 		child_genome = ga.duplicate_genome()
-	child_genome.mutate(rng, config.mutation_rate, config.mutation_scale)
+	# Drosophila: skip dead adapter loci unless interface_mix is active.
+	var mutate_adapter := (
+		config.brain_type != "drosophila" or child_genome.interface_mix > 0.01
+	)
+	child_genome.mutate(
+		rng,
+		config.mutation_rate,
+		config.mutation_scale,
+		mutate_adapter,
+		config.connectome_evolution_enabled
+	)
+	if config.connectome_evolution_enabled and child_genome.synapse_ids.is_empty():
+		# Inherit loci from a parent if present; else fill at hatch via brain init.
+		if not ga.synapse_ids.is_empty():
+			child_genome.ensure_sparse_synapses(ga.synapse_ids)
+			for i in mini(child_genome.synapse_mults.size(), ga.synapse_mults.size()):
+				child_genome.synapse_mults[i] = ga.synapse_mults[i]
+		elif not gb.synapse_ids.is_empty():
+			child_genome.ensure_sparse_synapses(gb.synapse_ids)
 
 	var egg := Egg.new()
 	egg.position = (female.body.position + male.body.position) * 0.5

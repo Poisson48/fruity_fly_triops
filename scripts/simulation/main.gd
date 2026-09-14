@@ -1,5 +1,5 @@
 extends Node3D
-## Main scene: fixed-step sim + FPS governor (target ≥ 30 FPS).
+## Main scene: fixed-step sim (wall-clock time). FPS only affects visuals, not sim speed.
 
 const SPEED_STEPS: Array[float] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
 const MENU_SCENE := "res://scenes/setup_menu.tscn"
@@ -15,6 +15,7 @@ var _speed_index: int = 2
 var _extinct_notified: bool = false
 var _fps_ema: float = 60.0
 var _visual_skip: int = 0
+var _base_gpu_brain_dt: float = 1.0 / 12.0
 
 @onready var aquarium: AquariumVisual = $Aquarium
 @onready var triops_visual: TriopsVisual = $TriopsVisual
@@ -22,6 +23,7 @@ var _visual_skip: int = 0
 @onready var egg_visual: EggVisual = $EggVisual
 @onready var camera: SimulationCamera = $Camera3D
 @onready var debug_ui: DebugUI = $DebugUI
+var void_visual: VoidSpaceVisual = null
 
 
 func _ready() -> void:
@@ -33,14 +35,37 @@ func _ready() -> void:
 		config.apply_preset_easy()
 
 	world.initialize(config)
-	aquarium.build(config.aquarium_half_extents)
+	_base_gpu_brain_dt = 1.0 / 60.0 if config.is_free_flight() else world.gpu_brain_dt
+	world.gpu_brain_dt = _base_gpu_brain_dt
+
+	if config.is_free_flight():
+		aquarium.visible = false
+		food_visual.visible = false
+		egg_visual.visible = false
+		void_visual = VoidSpaceVisual.new()
+		void_visual.name = "VoidSpace"
+		add_child(void_visual)
+		void_visual.build()
+		# Day-ish sky over the endless flat ground.
+		var we := get_node_or_null("WorldEnvironment") as WorldEnvironment
+		if we and we.environment:
+			we.environment.background_color = Color(0.45, 0.62, 0.82, 1)
+			we.environment.ambient_light_color = Color(0.7, 0.75, 0.8, 1)
+			we.environment.ambient_light_energy = 0.75
+	else:
+		aquarium.build(config.aquarium_half_extents)
+		food_visual.setup(config.food_count)
+		egg_visual.setup(16)
+
 	triops_visual.setup(config.max_triops)
-	food_visual.setup(config.food_count)
-	egg_visual.setup(16)
 	_sync_visuals()
 
 	camera.bind_world(world)
 	camera.setup_aquarium(config.aquarium_half_extents)
+	if config.is_free_flight():
+		camera.mode = SimulationCamera.Mode.FOLLOW
+		camera.follow_distance = 6.0
+		camera.max_distance = 120.0
 
 	debug_ui.pause_pressed.connect(_toggle_pause)
 	debug_ui.slower_pressed.connect(_slower)
@@ -51,39 +76,50 @@ func _ready() -> void:
 func _process(delta: float) -> void:
 	var fps := Engine.get_frames_per_second()
 	if fps > 1.0:
-		_fps_ema = lerpf(_fps_ema, float(fps), 0.1)
+		_fps_ema = lerpf(_fps_ema, float(fps), 0.12)
 
+	# Sim clock is fixed-step. Under load we take fewer, coarser slices (not slow-mo)
+	# so catch-up can't spiral into <10 FPS.
+	world.fps_ema = _fps_ema
 	world.speed_scale = time_scale
+	# Stretch neural interval when FPS tanks — wall-clock brain budget stays sane.
+	if _fps_ema < 18.0:
+		world.gpu_brain_dt = _base_gpu_brain_dt * 2.2
+	elif _fps_ema < 28.0:
+		world.gpu_brain_dt = _base_gpu_brain_dt * 1.5
+	else:
+		world.gpu_brain_dt = _base_gpu_brain_dt
 	world.begin_frame()
 
 	if not paused and time_scale > 0.0:
-		if time_scale <= 1.0:
-			# Accurate fixed-step at ≤1×.
-			_accum += delta * time_scale
-			var dt: float = config.simulation_dt
-			var max_steps := 8 if _fps_ema >= 50.0 else (4 if _fps_ema >= TARGET_FPS else 2)
-			var steps := 0
-			while _accum >= dt and steps < max_steps:
-				world.step(dt)
-				_accum -= dt
-				steps += 1
-			if _accum > dt * 8.0:
-				_accum = dt * 4.0
-		else:
-			# Fast-forward: large physics slices, ≤1 GPU brain/frame (via speed_scale).
-			_accum += delta * time_scale
-			var max_slices := mini(10, maxi(2, int(ceil(time_scale))))
-			var slice := minf(_accum / float(max_slices), 0.10)
-			slice = maxf(slice, config.simulation_dt)
-			var steps := 0
-			while _accum >= config.simulation_dt and steps < max_slices:
-				var dt := minf(slice, minf(_accum, 0.10))
-				world.step(dt)
-				_accum -= dt
-				steps += 1
-			# Soft cap leftover so we keep accelerating instead of stalling forever.
-			if _accum > time_scale * 0.5:
-				_accum = time_scale * 0.25
+		_accum += delta * time_scale
+		var dt: float = config.simulation_dt
+		var max_steps := 6
+		if _fps_ema < 16.0:
+			max_steps = 2
+		elif _fps_ema < 24.0:
+			max_steps = 3
+		elif _fps_ema < 32.0:
+			max_steps = 4
+		if time_scale > 1.0:
+			max_steps = mini(12, maxi(max_steps, int(ceil(time_scale * 3.0))))
+		var steps := 0
+		while _accum >= dt and steps < max_steps:
+			var step_dt := dt
+			# Coarser physics when behind or sped up — one slice covers more wall time.
+			var behind := _accum >= dt * 2.0
+			if behind or time_scale > 1.0:
+				var slice_cap := 0.05 if _fps_ema >= 24.0 else 0.08
+				if _fps_ema < 16.0:
+					slice_cap = 0.10
+				step_dt = minf(_accum, minf(slice_cap, dt * maxf(1.0, time_scale * 0.5)))
+				step_dt = maxf(step_dt, dt)
+			world.step(step_dt)
+			_accum -= step_dt
+			steps += 1
+		# Drop leftover rather than snowballing (brief time skip > death spiral).
+		if _accum > dt * float(max_steps):
+			_accum = 0.0
 	else:
 		_accum = 0.0
 
@@ -91,9 +127,15 @@ func _process(delta: float) -> void:
 		_extinct_notified = true
 		paused = true
 
-	# At high speed, sync visuals less often.
+	# Visual skip is display-only (smoothed poses). Does not change sim speed.
 	var vis_every := 1
-	if time_scale >= 8.0:
+	if _fps_ema < 22.0:
+		vis_every = 4
+	elif _fps_ema < 28.0:
+		vis_every = 3
+	elif _fps_ema < 36.0:
+		vis_every = 2
+	elif time_scale >= 8.0:
 		vis_every = 4
 	elif time_scale >= 4.0:
 		vis_every = 3
@@ -101,7 +143,7 @@ func _process(delta: float) -> void:
 		vis_every = 2
 	_visual_skip = (_visual_skip + 1) % vis_every
 	if _visual_skip == 0:
-		_sync_visuals()
+		_sync_visuals(delta * float(vis_every))
 	var cam_mode := camera.mode_name()
 	var backend := "cpu"
 	var eng := GpuLifEngine.get_engine()
@@ -116,10 +158,15 @@ func _process(delta: float) -> void:
 		bp.visible = debug_ui.visible and time_scale <= 2.0
 
 
-func _sync_visuals() -> void:
-	triops_visual.sync_from_simulation(world)
-	food_visual.sync_from_food(world.food)
-	egg_visual.sync_from_eggs(world.eggs)
+func _sync_visuals(delta: float = 1.0 / 60.0) -> void:
+	triops_visual.sync_from_simulation(world, delta)
+	if config != null and config.is_free_flight():
+		if void_visual != null and not world.agents.is_empty():
+			var a: TriopsAgent = world.agents[0]
+			void_visual.sync_from_void(world.void_space, a.body.position)
+	else:
+		food_visual.sync_from_food(world.food)
+		egg_visual.sync_from_eggs(world.eggs)
 
 
 func _unhandled_input(event: InputEvent) -> void:

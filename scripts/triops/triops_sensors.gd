@@ -7,6 +7,7 @@ extends RefCounted
 ## - Median / naupliar → frontal + lobula-plate proxies (HS/VS/expansion)
 ##
 ## Summaries (3×3) stay genome-compatible; mosaics drive retinotopic injection.
+## Ray origins sit on dorsal carapace eye sockets (body local, −Z forward).
 
 const CHANNELS_PER_EYE := 3
 const AZ := 8
@@ -16,11 +17,37 @@ const MED_AZ := 4
 const MED_EL := 4
 const MED_FACETS := MED_AZ * MED_EL ## 16
 
+## Body-local eye sockets (−Z forward, +Y up, +X right).
+## Tuned to Meshy carapace after model_basis 180° yaw + VISUAL_MODEL_SCALE.
+const EYE_SCALE := 2.5
+const EYE_LEFT_LOCAL := Vector3(-0.14, 0.16, -0.52) * EYE_SCALE
+const EYE_RIGHT_LOCAL := Vector3(0.14, 0.16, -0.52) * EYE_SCALE
+const EYE_MEDIAN_LOCAL := Vector3(0.0, 0.12, -0.58) * EYE_SCALE
+
 var last_packet: SensoryPacket = SensoryPacket.new()
 var _prev_left_depth: PackedFloat32Array = PackedFloat32Array()
 var _prev_right_depth: PackedFloat32Array = PackedFloat32Array()
 var _prev_median_depth: PackedFloat32Array = PackedFloat32Array()
 var _have_prev: bool = false
+
+## Half-angles (radians) + compound outward cant — set via apply_config().
+var compound_fov_h: float = deg_to_rad(55.0)
+var compound_fov_v: float = deg_to_rad(42.5)
+var compound_cant: float = deg_to_rad(38.0)
+var median_fov_h: float = deg_to_rad(35.0)
+var median_fov_v: float = deg_to_rad(37.5)
+
+
+func apply_config(config: SimulationConfig) -> void:
+	compound_fov_h = deg_to_rad(config.eye_compound_fov_h_deg * 0.5)
+	compound_fov_v = deg_to_rad(config.eye_compound_fov_v_deg * 0.5)
+	compound_cant = deg_to_rad(config.eye_compound_cant_deg)
+	median_fov_h = deg_to_rad(config.eye_median_fov_h_deg * 0.5)
+	median_fov_v = deg_to_rad(config.eye_median_fov_v_deg * 0.5)
+
+
+static func eye_world_pos(position: Vector3, orientation: Basis, local: Vector3, body_scale: float) -> Vector3:
+	return position + orientation * (local * body_scale)
 
 
 func sense(
@@ -32,9 +59,13 @@ func sense(
 	mates: Array[Vector3],
 	mate_radius: float,
 	velocity: Vector3 = Vector3.ZERO,
-	food_radius: float = 8.0
+	food_radius: float = 8.0,
+	body_scale: float = 1.0
 ) -> SensoryPacket:
 	var packet := SensoryPacket.new()
+	var left_o := eye_world_pos(position, orientation, EYE_LEFT_LOCAL, body_scale)
+	var right_o := eye_world_pos(position, orientation, EYE_RIGHT_LOCAL, body_scale)
+	var med_o := eye_world_pos(position, orientation, EYE_MEDIAN_LOCAL, body_scale)
 	var left_dirs := _compound_gaze(orientation, true)
 	var right_dirs := _compound_gaze(orientation, false)
 	var med_dirs := _median_gaze_grid(orientation)
@@ -42,13 +73,13 @@ func sense(
 	var food_near := food.nearby_indices(position, maxf(ray_length, food_radius)) if food != null else PackedInt32Array()
 
 	var L := _sample_compound(
-		position, half_extents, ray_length, food, food_near, mates, mate_radius, velocity, left_dirs, AZ, EL, _prev_left_depth
+		left_o, half_extents, ray_length, food, food_near, mates, mate_radius, velocity, left_dirs, AZ, EL, _prev_left_depth
 	)
 	var R := _sample_compound(
-		position, half_extents, ray_length, food, food_near, mates, mate_radius, velocity, right_dirs, AZ, EL, _prev_right_depth
+		right_o, half_extents, ray_length, food, food_near, mates, mate_radius, velocity, right_dirs, AZ, EL, _prev_right_depth
 	)
 	var M := _sample_compound(
-		position, half_extents, ray_length, food, food_near, mates, mate_radius, velocity, med_dirs, MED_AZ, MED_EL, _prev_median_depth
+		med_o, half_extents, ray_length, food, food_near, mates, mate_radius, velocity, med_dirs, MED_AZ, MED_EL, _prev_median_depth
 	)
 
 	packet.left_on = L.on
@@ -98,7 +129,9 @@ func sense(
 	packet.ceiling_loom = _wall_loom(position, Vector3.UP, half_extents, ray_length, velocity)
 	packet.depth_norm = clampf(position.y / maxf(half_extents.y, 0.01), -1.0, 1.0)
 	if food != null:
-		var food_vert := food.nearby_indices(position, food_radius) if food_near.is_empty() else food_near
+		var food_vert := food_near if not food_near.is_empty() else (
+			food.nearby_indices(position, food_radius) if food != null else PackedInt32Array()
+		)
 		packet.food_up = food.ray_food_signal_candidates(position, Vector3.UP, food_radius, food_vert)
 		packet.food_down = food.ray_food_signal_candidates(position, Vector3.DOWN, food_radius, food_vert)
 		packet.food_up = maxf(
@@ -161,10 +194,14 @@ func sense_walls_fast(
 	orientation: Basis,
 	half_extents: Vector3,
 	ray_length: float,
-	velocity: Vector3 = Vector3.ZERO
+	velocity: Vector3 = Vector3.ZERO,
+	body_scale: float = 1.0
 ) -> SensoryPacket:
 	## Cheap refresh between brain ticks: walls / loom / flow only (no food scans).
 	var packet := last_packet if last_packet != null else SensoryPacket.new()
+	var left_o := eye_world_pos(position, orientation, EYE_LEFT_LOCAL, body_scale)
+	var right_o := eye_world_pos(position, orientation, EYE_RIGHT_LOCAL, body_scale)
+	var med_o := eye_world_pos(position, orientation, EYE_MEDIAN_LOCAL, body_scale)
 	var left_dirs := _compound_gaze(orientation, true)
 	var right_dirs := _compound_gaze(orientation, false)
 	var med_dirs := _median_gaze_grid(orientation)
@@ -172,13 +209,13 @@ func sense_walls_fast(
 	var empty_mates: Array[Vector3] = []
 
 	var L := _sample_compound(
-		position, half_extents, ray_length, null, empty_food, empty_mates, 0.0, velocity, left_dirs, AZ, EL, _prev_left_depth
+		left_o, half_extents, ray_length, null, empty_food, empty_mates, 0.0, velocity, left_dirs, AZ, EL, _prev_left_depth
 	)
 	var R := _sample_compound(
-		position, half_extents, ray_length, null, empty_food, empty_mates, 0.0, velocity, right_dirs, AZ, EL, _prev_right_depth
+		right_o, half_extents, ray_length, null, empty_food, empty_mates, 0.0, velocity, right_dirs, AZ, EL, _prev_right_depth
 	)
 	var M := _sample_compound(
-		position, half_extents, ray_length, null, empty_food, empty_mates, 0.0, velocity, med_dirs, MED_AZ, MED_EL, _prev_median_depth
+		med_o, half_extents, ray_length, null, empty_food, empty_mates, 0.0, velocity, med_dirs, MED_AZ, MED_EL, _prev_median_depth
 	)
 
 	# Keep previous ON/food & mate mosaics; refresh OFF/loom/flow/expand.
@@ -226,6 +263,267 @@ func sense_walls_fast(
 	_have_prev = true
 	last_packet = packet
 	return packet
+
+
+func apply_obstacles(
+	packet: SensoryPacket,
+	position: Vector3,
+	orientation: Basis,
+	velocity: Vector3,
+	void_world: ProceduralVoid,
+	ray_length: float,
+	body_scale: float = 1.0
+) -> void:
+	## FlyWire-facing LPLC-style loom: early detect, strong L/R asymmetry, clear-side bias.
+	if void_world == null or void_world.obstacle_count <= 0:
+		return
+	var ray := maxf(ray_length, 48.0)
+	var left_o := eye_world_pos(position, orientation, EYE_LEFT_LOCAL, body_scale)
+	var right_o := eye_world_pos(position, orientation, EYE_RIGHT_LOCAL, body_scale)
+	var med_o := eye_world_pos(position, orientation, EYE_MEDIAN_LOCAL, body_scale)
+	var fwd := -orientation.z
+	var right := orientation.x
+	var up := orientation.y
+
+	var loom_l := 0.0
+	var loom_r := 0.0
+	var loom_m := 0.0
+	var t_l_best := ray
+	var t_r_best := ray
+	# Wide fan for L/R eyes; NARROW cone only for frontal expand (don't panic on side gates).
+	var fans_side: Array = [
+		fwd,
+		(fwd + right * 0.22).normalized(),
+		(fwd - right * 0.22).normalized(),
+		(fwd + right * 0.45).normalized(),
+		(fwd - right * 0.45).normalized(),
+		(fwd + right * 0.75).normalized(),
+		(fwd - right * 0.75).normalized(),
+		(fwd + up * 0.2).normalized(),
+		(fwd - up * 0.15).normalized(),
+	]
+	var fans_front: Array = [
+		fwd,
+		(fwd + right * 0.12).normalized(),
+		(fwd - right * 0.12).normalized(),
+		(fwd + up * 0.1).normalized(),
+		(fwd - up * 0.08).normalized(),
+	]
+	for d in fans_side:
+		var dir: Vector3 = d
+		var tl := void_world.ray_obstacle_t(left_o, dir, ray)
+		var tr := void_world.ray_obstacle_t(right_o, dir, ray)
+		t_l_best = minf(t_l_best, tl)
+		t_r_best = minf(t_r_best, tr)
+		loom_l = maxf(loom_l, _obstacle_loom_from_t(tl, dir, ray, velocity))
+		loom_r = maxf(loom_r, _obstacle_loom_from_t(tr, dir, ray, velocity))
+	for d2 in fans_front:
+		var dir2: Vector3 = d2
+		var tm := void_world.ray_obstacle_t(med_o, dir2, ray)
+		loom_m = maxf(loom_m, _obstacle_loom_from_t(tm, dir2, ray, velocity))
+
+	# Clear-side probe: if dead-ahead, force asymmetry toward the open gap.
+	var t_open_l := void_world.ray_obstacle_t(med_o, (fwd - right * 0.55).normalized(), ray)
+	var t_open_r := void_world.ray_obstacle_t(med_o, (fwd + right * 0.55).normalized(), ray)
+	if loom_m > 0.35 and absf(loom_l - loom_r) < 0.10:
+		if t_open_l > t_open_r + 2.5:
+			loom_r = maxf(loom_r, loom_m * 0.9 + 0.18)
+		elif t_open_r > t_open_l + 2.5:
+			loom_l = maxf(loom_l, loom_m * 0.9 + 0.18)
+		elif minf(t_l_best, t_r_best) < 12.0:
+			if t_l_best <= t_r_best:
+				loom_l = maxf(loom_l, loom_m * 0.85 + 0.15)
+			else:
+				loom_r = maxf(loom_r, loom_m * 0.85 + 0.15)
+
+	var frontal := loom_m
+	# Side pillars in periphery ≠ escape saccade. Gate L/R by frontal threat.
+	var side_gate := clampf((frontal - 0.15) / 0.4, 0.0, 1.0)
+	var side_l := loom_l * (0.2 + 0.8 * side_gate)
+	var side_r := loom_r * (0.2 + 0.8 * side_gate)
+	packet.expand_l = maxf(packet.expand_l, side_l * 1.15)
+	packet.expand_r = maxf(packet.expand_r, side_r * 1.15)
+	# Frontal expand only (true LPLC) — don't saturate from side clutter.
+	packet.expand_m = maxf(packet.expand_m, frontal * 1.35)
+	if packet.left_eye.size() >= 1:
+		packet.left_eye[0] = maxf(packet.left_eye[0], side_l * 1.15)
+	if packet.right_eye.size() >= 1:
+		packet.right_eye[0] = maxf(packet.right_eye[0], side_r * 1.15)
+	if packet.median_eye.size() >= 1:
+		packet.median_eye[0] = maxf(packet.median_eye[0], frontal * 1.3)
+	_boost_ventral_off(packet.left_off, side_l * 1.2)
+	_boost_ventral_off(packet.right_off, side_r * 1.2)
+	_boost_ventral_off(packet.median_off, frontal * 1.35)
+	_boost_side_off(packet.left_off, side_l * 1.1, true)
+	_boost_side_off(packet.right_off, side_r * 1.1, false)
+	if packet.left_eye.size() >= 1 and side_r > side_l:
+		packet.left_eye[0] = maxf(packet.left_eye[0], side_r * 0.3)
+	if packet.right_eye.size() >= 1 and side_l > side_r:
+		packet.right_eye[0] = maxf(packet.right_eye[0], side_l * 0.3)
+	var avoid_yaw := clampf((side_r - side_l) * 1.25 * side_gate, -1.5, 1.5)
+	packet.flow_yaw = clampf(packet.flow_yaw * 0.15 + avoid_yaw, -1.5, 1.5)
+	if packet.left_eye.size() > 1:
+		packet.left_eye[1] *= 0.08
+	if packet.right_eye.size() > 1:
+		packet.right_eye[1] *= 0.08
+	if packet.median_eye.size() > 1:
+		packet.median_eye[1] *= 0.08
+
+
+func _obstacle_loom_from_t(min_t: float, dir: Vector3, ray_length: float, velocity: Vector3) -> float:
+	## Hot when close or closing fast (tau) — not a distant wall of panic.
+	if min_t >= ray_length:
+		return 0.0
+	# Ignore far static clutter; react inside ~18u or on collision course.
+	var closing := maxf(0.0, velocity.dot(dir.normalized()))
+	var tau := 0.0
+	if min_t > 0.08:
+		tau = clampf(closing / min_t, 0.0, 12.0) / 12.0
+	else:
+		tau = 1.0
+	var near := clampf(1.0 - min_t / 14.0, 0.0, 1.0)
+	near = near * near
+	var prox := clampf(1.0 - min_t / 22.0, 0.0, 1.0)
+	prox = prox * prox * prox
+	var loom := near * 0.85 + tau * 0.95 + prox * tau * 0.65 + prox * 0.25
+	return clampf(loom, 0.0, 1.0)
+
+
+func _boost_side_off(field: PackedFloat32Array, amp: float, left_eye: bool) -> void:
+	if field.is_empty() or amp < 0.03:
+		return
+	var n := field.size()
+	var half := int(n / 2)
+	var start := 0 if left_eye else half
+	var stop := half if left_eye else n
+	for i in range(start, stop):
+		field[i] = minf(field[i] + amp * 1.1, 3.5)
+
+
+func apply_corridor_goal(packet: SensoryPacket, orientation: Basis, void_world: ProceduralVoid) -> void:
+	## Corridor objective → optic HS / bearing into FlyWire (not a body autopilot).
+	if void_world == null:
+		return
+	var yaw := void_world.heading_error_yaw(orientation)
+	# Cross-track: +X drift → right turn (−yaw) back to centerline.
+	var cross := clampf(-void_world.lateral_error / 8.0, -1.0, 1.0)
+	var threat := packet.expand_m
+	var goal_w := clampf(1.0 - maxf(threat - 0.4, 0.0) * 1.5, 0.6, 1.0)
+	packet.food_bearing_yaw = clampf((yaw * 1.2 + cross * 0.7) * goal_w, -1.2, 1.2)
+	packet.food_bearing_strength = 1.3 * goal_w
+	var avoid_keep := clampf((threat - 0.35) / 0.45, 0.0, 0.75)
+	packet.flow_yaw = clampf(
+		packet.flow_yaw * avoid_keep + packet.food_bearing_yaw * (0.95 * goal_w),
+		-1.5,
+		1.5
+	)
+	var on_goal := 1.25 * goal_w
+	if packet.median_eye.size() > 1:
+		packet.median_eye[1] = maxf(packet.median_eye[1], on_goal)
+	# Need left (+yaw) → more ON on left eye (and vice versa).
+	if packet.left_eye.size() > 1:
+		packet.left_eye[1] = maxf(packet.left_eye[1], on_goal * (0.55 + 0.45 * maxf(yaw, 0.0)))
+	if packet.right_eye.size() > 1:
+		packet.right_eye[1] = maxf(packet.right_eye[1], on_goal * (0.55 + 0.45 * maxf(-yaw, 0.0)))
+	_boost_goal_on(packet.median_on, on_goal)
+	_boost_goal_on(packet.left_on, on_goal * (0.5 + 0.4 * maxf(yaw, 0.0)))
+	_boost_goal_on(packet.right_on, on_goal * (0.5 + 0.4 * maxf(-yaw, 0.0)))
+
+
+func _boost_goal_on(field: PackedFloat32Array, amp: float) -> void:
+	if field.is_empty() or amp < 0.02:
+		return
+	# Central / frontal facets.
+	var n := field.size()
+	var mid := int(n / 2)
+	var span := maxi(2, int(n / 5))
+	for i in range(maxi(0, mid - span), mini(n, mid + span + 1)):
+		field[i] = minf(field[i] + amp, 3.5)
+
+
+func _ch_eye(eye: PackedFloat32Array, i: int) -> float:
+	return eye[i] if i < eye.size() else 0.0
+
+
+func apply_flight_altitude(
+	packet: SensoryPacket,
+	position: Vector3,
+	velocity: Vector3,
+	preferred_alt: float,
+	band: float,
+	ray_length: float,
+	ground_y: float = 0.0
+) -> void:
+	## Drosophila-style altitude: ventral loom + regulate ground optic-flow rate.
+	## Feeds floor/ceiling loom, VS pitch, expand/OFF — SEZ must climb/dive.
+	var h := maxf(position.y - ground_y, 0.05)
+	var pref := maxf(preferred_alt, 0.8)
+	var band_w := maxf(band, 0.6)
+	var ray := maxf(ray_length, pref * 2.0)
+
+	# Hard proximity to ground (collision loom).
+	var floor_hit := _wall_loom_from_t(h, Vector3.DOWN, ray, velocity)
+
+	# Ventral optic-flow rate ~ horiz_speed / altitude (classic fly altitude cue).
+	# Only when translating — near-hover low flow must NOT read as "too high".
+	var horiz := Vector2(velocity.x, velocity.z).length()
+	var move := clampf((horiz - 0.6) / 3.0, 0.0, 1.0)
+	var optic := horiz / h
+	var target_optic := 5.5 / pref  ## cruise ~5.5 u/s at preferred height
+	var flow_err := clampf(optic - target_optic, -1.5, 1.5)
+	# Positive flow_err → too close / ground rushing → climb.
+	var flow_climb := clampf(flow_err, 0.0, 1.5) * move
+	var flow_dive := clampf(-flow_err, 0.0, 1.5) * move
+
+	# Soft band around preferred altitude (even when nearly hovering).
+	var below := clampf((pref - h) / band_w, 0.0, 1.0)
+	var above := clampf((h - pref) / (band_w * 1.15), 0.0, 1.0)
+
+	packet.floor_loom = clampf(maxf(floor_hit, maxf(flow_climb * 0.75, below * 0.85)), 0.0, 1.0)
+	# Ceiling only when actually above preferred (plus mild optic dive while moving).
+	packet.ceiling_loom = clampf(above * 0.95 + flow_dive * 0.55 * above, 0.0, 1.0)
+	# Stronger sky pressure once clearly above the band (prevent climb overshoot).
+	if h > pref + band_w * 0.35:
+		packet.ceiling_loom = clampf(packet.ceiling_loom + above * 0.35, 0.0, 1.0)
+		packet.floor_loom *= 0.4
+	# Near ground: never allow a dive cue.
+	if h < pref * 0.75:
+		packet.ceiling_loom = 0.0
+		packet.floor_loom = clampf(packet.floor_loom + 0.25, 0.0, 1.0)
+	# depth_norm: -1 near ground, 0 at preferred, +1 too high.
+	packet.depth_norm = clampf((h - pref) / band_w, -1.5, 1.5)
+
+	# Pitch flow: climb request positive (nose-up / VS).
+	var alt_pitch := packet.floor_loom * 0.85 - packet.ceiling_loom * 1.05
+	packet.flow_pitch = clampf(packet.flow_pitch * 0.35 + alt_pitch, -1.5, 1.5)
+
+	# Ventral OFF / expansion when ground is close (LPLC-like).
+	var ground_expand := clampf(floor_hit * 1.35 + below * 0.4, 0.0, 1.6)
+	packet.expand_m = maxf(packet.expand_m, ground_expand)
+	packet.expand_l = maxf(packet.expand_l, ground_expand * 0.7)
+	packet.expand_r = maxf(packet.expand_r, ground_expand * 0.7)
+	if packet.median_eye.size() >= 1:
+		packet.median_eye[0] = maxf(packet.median_eye[0], ground_expand)
+	if packet.left_eye.size() >= 1:
+		packet.left_eye[0] = maxf(packet.left_eye[0], ground_expand * 0.55)
+	if packet.right_eye.size() >= 1:
+		packet.right_eye[0] = maxf(packet.right_eye[0], ground_expand * 0.55)
+	_boost_ventral_off(packet.median_off, ground_expand)
+	_boost_ventral_off(packet.left_off, ground_expand * 0.45)
+	_boost_ventral_off(packet.right_off, ground_expand * 0.45)
+
+	# Reuse vertical ON channels as altitude drive (no food in free flight).
+	packet.food_up = packet.floor_loom * 1.25
+	packet.food_down = packet.ceiling_loom * 1.35
+
+
+func _boost_ventral_off(field: PackedFloat32Array, amp: float) -> void:
+	if field.is_empty() or amp < 0.02:
+		return
+	# Lower half of mosaic ≈ more ventral facets.
+	var start := int(field.size() / 2)
+	for i in range(start, field.size()):
+		field[i] = minf(field[i] + amp, 3.5)
 
 
 func axis_loom(
@@ -286,8 +584,9 @@ func _sample_compound(
 	var expand_n := 0
 	for i in n:
 		var dir: Vector3 = dirs[i] if i < dirs.size() else Vector3.FORWARD
-		var d_norm := _wall_depth_norm(origin, dir, half, ray_length)
-		var loom := _wall_loom(origin, dir, half, ray_length, velocity)
+		var t_hit := _wall_hit_t(origin, dir, half, ray_length)
+		var d_norm := clampf(t_hit / ray_length, 0.0, 1.0)
+		var loom := _wall_loom_from_t(t_hit, dir, ray_length, velocity)
 		var food_s := (
 			food.ray_food_signal_candidates(origin, dir, ray_length, food_near) if food != null else 0.0
 		)
@@ -349,25 +648,39 @@ func _sample_compound(
 
 
 func _compound_gaze(basis: Basis, is_left: bool) -> PackedVector3Array:
-	## Retinotopic grid covering compound-eye hemisphere (fly ME-like).
-	var forward := -basis.z
+	## Retinotopic grid inside compound FOV, boresight canted outward from body forward.
+	var body_fwd := -basis.z
 	var side := (-basis.x) if is_left else basis.x
 	var up := basis.y
+	var bore := (body_fwd * cos(compound_cant) + side * sin(compound_cant)).normalized()
+	var bore_right := bore.cross(up)
+	if bore_right.length_squared() < 1e-8:
+		bore_right = side
+	else:
+		bore_right = bore_right.normalized()
+	var bore_up := bore_right.cross(bore).normalized()
 	var out := PackedVector3Array()
 	out.resize(FACETS)
 	for el in EL:
 		var el_t := (float(el) + 0.5) / float(EL) ## 0..1 bottom→top
-		var pitch := lerpf(-0.55, 0.65, el_t)
+		var pitch := lerpf(-compound_fov_v, compound_fov_v, el_t)
 		for az in AZ:
-			var az_t := (float(az) + 0.5) / float(AZ) ## 0=front-ish … 1=back-lateral
-			var yaw := lerpf(0.15, 1.15, az_t)
-			var dir := (forward * cos(yaw) + side * sin(yaw) + up * pitch).normalized()
+			var az_t := (float(az) + 0.5) / float(AZ)
+			# Sweep from front-ish toward lateral within FOV (asymmetric bias ok for ME).
+			var yaw := lerpf(-compound_fov_h * 0.35, compound_fov_h, az_t)
+			if not is_left:
+				yaw = -yaw
+			var dir := (
+				bore * cos(yaw) * cos(pitch)
+				+ bore_right * sin(yaw) * cos(pitch)
+				+ bore_up * sin(pitch)
+			).normalized()
 			out[el * AZ + az] = dir
 	return out
 
 
 func _median_gaze_grid(basis: Basis) -> PackedVector3Array:
-	## Frontal acute zone + slight dorsal bias (naupliar → LOP / frontal ME).
+	## Frontal acute zone within median FOV (naupliar → LOP / frontal ME).
 	var forward := -basis.z
 	var right := basis.x
 	var up := basis.y
@@ -375,11 +688,15 @@ func _median_gaze_grid(basis: Basis) -> PackedVector3Array:
 	out.resize(MED_FACETS)
 	for el in MED_EL:
 		var el_t := (float(el) + 0.5) / float(MED_EL)
-		var pitch := lerpf(-0.35, 0.85, el_t)
+		var pitch := lerpf(-median_fov_v, median_fov_v, el_t)
 		for az in MED_AZ:
 			var az_t := (float(az) + 0.5) / float(MED_AZ)
-			var yaw := lerpf(-0.45, 0.45, az_t)
-			var dir := (forward + right * yaw + up * pitch).normalized()
+			var yaw := lerpf(-median_fov_h, median_fov_h, az_t)
+			var dir := (
+				forward * cos(yaw) * cos(pitch)
+				+ right * sin(yaw) * cos(pitch)
+				+ up * sin(pitch)
+			).normalized()
 			out[el * MED_AZ + az] = dir
 	return out
 
@@ -513,9 +830,12 @@ func _wall_loom(
 	velocity: Vector3
 ) -> float:
 	var min_t := _wall_hit_t(origin, direction, half, ray_length)
+	return _wall_loom_from_t(min_t, direction.normalized(), ray_length, velocity)
+
+
+func _wall_loom_from_t(min_t: float, dir: Vector3, ray_length: float, velocity: Vector3) -> float:
 	if min_t >= ray_length:
 		return 0.0
-	var dir := direction.normalized()
 	var prox := clampf(1.0 - min_t / (ray_length * 0.7), 0.0, 1.0)
 	prox = prox * prox
 	var closing := maxf(0.0, velocity.dot(dir))
